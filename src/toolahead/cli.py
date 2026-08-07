@@ -276,10 +276,75 @@ def init_claude(args) -> int:
     return 0
 
 
+def init_antigravity(args) -> int:
+    """Workspace-local MCP config for Google Antigravity (CLI and IDE).
+
+    Antigravity discovers stdio servers from ``.agents/mcp_config.json`` in
+    the active project. There is no ToolAhead lifecycle hook here yet: the
+    MCP server's own PreToolUse/PostToolUse reports are the only event
+    source, which already drives learning and latest-mutation-wins for every
+    call routed through the ToolAhead tools.
+    """
+    project = Path(args.project).resolve()
+    mcp_path = project / ".agents" / "mcp_config.json"
+    runtime, installed_mcp = _runtime(project)
+    url = getattr(args, "url", DEFAULT_URL)
+
+    def load_object(path: Path) -> dict:
+        if not path.exists():
+            return {}
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("top-level JSON value must be an object")
+        return value
+
+    try:
+        mcp = load_object(mcp_path)
+    except (OSError, ValueError) as exc:
+        print(f"Cannot merge Antigravity workspace config: {exc}",
+              file=sys.stderr)
+        return 2
+    servers = mcp.setdefault("mcpServers", {})
+    if not isinstance(servers, dict):
+        print(f"'mcpServers' must be an object in {mcp_path}", file=sys.stderr)
+        return 2
+    servers["toolahead"] = {
+        "command": "python3",
+        "args": [str(installed_mcp), "--workspace", str(project),
+                 "--url", url],
+        "env": {"TOOLAHEAD_MCP_EVENTS": "1"},
+    }
+    mcp_payload = json.dumps(mcp, indent=2, ensure_ascii=False) + "\n"
+    if args.dry_run:
+        print(f"# {mcp_path}\n{mcp_payload}", end="")
+        return 0
+    _install_mcp_runtime(project)
+    mcp_path.parent.mkdir(parents=True, exist_ok=True)
+    mcp_path.write_text(mcp_payload, encoding="utf-8")
+    replay = project / ".prefetch-replay.json"
+    if not replay.exists():
+        replay.write_text('{\n  "commands": []\n}\n', encoding="utf-8")
+    print(f"Installed Antigravity MCP: {mcp_path}")
+    print(f"MCP runtime:               {installed_mcp.parent}")
+    print(f"Replay allowlist:          {replay}")
+    print("Antigravity reads workspace servers from .agents/mcp_config.json; "
+          "run /mcp once in the prompt panel to confirm toolahead is enabled.")
+    return 0
+
+
+INIT_AGENTS = {"codex": init_codex, "claude": init_claude,
+               "antigravity": init_antigravity}
+
+
 def init_all(args) -> int:
-    agents = ("codex", "claude") if args.agent == "both" else (args.agent,)
+    if args.agent == "both":
+        agents = ("codex", "claude")
+    elif args.agent == "all":
+        agents = ("codex", "claude", "antigravity")
+    else:
+        agents = (args.agent,)
     for agent in agents:
-        result = init_codex(args) if agent == "codex" else init_claude(args)
+        result = INIT_AGENTS[agent](args)
         if result:
             return result
     return 0
@@ -462,12 +527,21 @@ def build_parser() -> argparse.ArgumentParser:
                                  help="hide native file-tool analogs")
     init_claude_cmd.set_defaults(func=init_claude)
 
+    init_ag_cmd = sub.add_parser(
+        "init-antigravity",
+        help="install workspace-local MCP config for Google Antigravity")
+    init_ag_cmd.add_argument("--project", default=os.getcwd())
+    init_ag_cmd.add_argument("--url", default=DEFAULT_URL)
+    init_ag_cmd.add_argument("--dry-run", action="store_true")
+    init_ag_cmd.set_defaults(func=init_antigravity)
+
     init_all_cmd = sub.add_parser(
-        "init", help="install ToolAhead MCP and hooks for one or both agents")
+        "init", help="install ToolAhead MCP and hooks for your agents")
     init_all_cmd.add_argument("--project", default=os.getcwd())
     init_all_cmd.add_argument("--url", default=DEFAULT_URL)
-    init_all_cmd.add_argument("--agent", choices=("both", "codex", "claude"),
-                              default="both")
+    init_all_cmd.add_argument(
+        "--agent", choices=("both", "all", "codex", "claude", "antigravity"),
+        default="both")
     init_all_cmd.add_argument("--dry-run", action="store_true")
     init_all_cmd.add_argument("--strict", action="store_true",
                               help="install coherent ToolAhead file-tool routing")

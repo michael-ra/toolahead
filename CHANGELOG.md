@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2 — 2026-08-07
+
+- Added Google Antigravity support: `toolahead init-antigravity` writes the
+  workspace-local `.agents/mcp_config.json` that the Antigravity CLI and IDE
+  discover, and `toolahead init --agent all` covers Codex, Claude Code, and
+  Antigravity together. Learning and latest-mutation-wins are driven by the
+  MCP server's own lifecycle reports — no native hooks required.
+
 ## 0.3.1 — 2026-08-07
 
 - Fixed README images on PyPI by using absolute asset URLs, and added the

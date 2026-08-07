@@ -21,6 +21,7 @@
     <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square&labelColor=111827">
     <img alt="Claude Code" src="https://img.shields.io/badge/Claude%20Code-supported-FFCC00?style=flat-square&labelColor=111827">
     <img alt="Codex CLI" src="https://img.shields.io/badge/Codex%20CLI-supported-FFCC00?style=flat-square&labelColor=111827">
+    <img alt="Antigravity" src="https://img.shields.io/badge/Antigravity-supported-FFCC00?style=flat-square&labelColor=111827">
     <img alt="MCP" src="https://img.shields.io/badge/MCP-native-8b5cf6?style=flat-square&labelColor=111827">
     <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square&labelColor=111827">
   </p>
@@ -116,6 +117,8 @@ Run these commands inside the project you want to accelerate:
 ```bash
 # Connect both agents to ToolAhead and install the required hooks.
 uvx toolahead init --agent both --strict --project .
+# Google Antigravity user? Add --agent all, or run: uvx toolahead init-antigravity
+# (writes the workspace-local .agents/mcp_config.json Antigravity discovers)
 
 # Allow this exact test command to run ahead and be reused.
 uvx toolahead allow "python3 -m pytest" --project .
