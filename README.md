@@ -12,7 +12,8 @@
 
   <p>
     ToolAhead learns recurring tool sequences in a repository and starts safe,
-    repeatable calls before Codex or Claude Code requests them. Prepared output
+    repeatable calls before Codex, Claude Code, or Antigravity requests them.
+    Prepared output
     is returned only when the eventual call and workspace match exactly.
   </p>
 
@@ -107,8 +108,8 @@ cd toolahead
 uvx --from . toolahead --help
 ```
 
-Requirements: Python 3.11+, macOS or Linux, and an authenticated Codex CLI or
-Claude Code installation. `watchdog` is optional.
+Requirements: Python 3.11+, macOS or Linux, and an authenticated Codex CLI,
+Claude Code, or Google Antigravity installation. `watchdog` is optional.
 
 ## Quickstart
 
@@ -144,6 +145,10 @@ Claude Code:
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:4242 claude
 ```
+
+Google Antigravity: open the project as usual — workspace MCP servers from
+`.agents/mcp_config.json` are discovered automatically. Run `/mcp` in the
+prompt panel once to confirm the `toolahead` server is enabled.
 
 See live timing and cache statistics at any time:
 
@@ -463,6 +468,7 @@ single paper. The closest foundations are:
   verification across speculative execution.
 
 ToolAhead combines these directions with local Codex and Claude Code hooks,
+Antigravity workspace MCP discovery,
 exact call-and-workspace matching, MCP result replay, mutation generations, and
 a standalone Python package. All benchmark numbers above are ToolAhead's own
 measurements, not results reported by those papers.
