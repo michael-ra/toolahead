@@ -331,6 +331,7 @@ class PrefetchEngine:
         # cancelled and its newest replacement is queued by exact command key.
         self.mutation_generation = 0
         self.last_mutation_wall: float | None = None
+        self._recent_edit_paths: list[str] = []
         self.pending_restarts: dict[str, dict] = {}
         self.mutation_timers: dict[str, dict] = {}
         self.mutation_debounce_s = max(
@@ -701,7 +702,8 @@ class PrefetchEngine:
         # Services jetzt hochfahren, damit sie beim echten Call warm sind —
         # und deklarierte Routen (inkl. Datei→Route-Heuristik) vorwaermen.
         self.services.prewarm("mutation")
-        self.services.warm_after_mutation(changed_path)
+        self.services.warm_after_mutation(
+            changed_path, learned_routes=self.learned_routes_for(changed_path))
         return generation
 
     def handle_agent_event(self, event: dict) -> dict:
@@ -788,7 +790,16 @@ class PrefetchEngine:
             self.record_transition(previous, cur, tool, args)
             mutation_generation = None
             mutation_failed = tool == "edit" and not self._mutation_succeeded(event)
+            if tool == "bash":
+                self._learn_routes(args.get("command", ""))
             if tool == "edit" and not mutation_failed:
+                edited = _path_key(args.get("path", ""), self.workspace)
+                if edited:
+                    with self.lock:
+                        if edited in self._recent_edit_paths:
+                            self._recent_edit_paths.remove(edited)
+                        self._recent_edit_paths.append(edited)
+                        del self._recent_edit_paths[:-5]
                 mutation_generation = self.note_mutation(
                     meta, changed_path=args.get("path"))
             if tool == "grep":
@@ -838,6 +849,83 @@ class PrefetchEngine:
         if name in ("Stop", "SessionEnd"):
             self.save()
         return {"ok": True, **recorded}
+
+    # -- Gelernte Datei→Route-Transitionen (Stufe 2 des Route-Warmings) --
+    #
+    # Beobachtet, welche URLs der Agent nach Edits bestimmter Dateien wirklich
+    # anfragt (aus Bash-Kommandos und referenzierten Shell-Skripten), und
+    # merkt sie in der Transition-Table unter einem eigenen Key-Namespace
+    # (``editfile:<pfad>`` → ``route:<pfad>``), der nie mit Tool-Chain-Keys
+    # kollidiert. Gelernt wird nur fuer Origins deklarierter Services.
+
+    _URL_RE = re.compile(r"https?://[^\s\"'`)>]+")
+
+    def _service_origins(self) -> set[str]:
+        return {spec.base_url() for spec in self.services.specs.values()
+                if spec.base_url() is not None}
+
+    def _urls_in_command(self, command: str) -> list[str]:
+        texts = [command]
+        for word in _shell_words(command):
+            if word.endswith(".sh"):
+                path = word if os.path.isabs(word) \
+                    else os.path.join(self.workspace, word)
+                real = os.path.realpath(path)
+                ws = os.path.realpath(self.workspace)
+                try:
+                    inside = os.path.commonpath((ws, real)) == ws
+                except ValueError:
+                    inside = False
+                if inside and os.path.isfile(real) \
+                        and os.path.getsize(real) <= 65536:
+                    try:
+                        with open(real, encoding="utf-8",
+                                  errors="replace") as fh:
+                            texts.append(fh.read())
+                    except OSError:
+                        pass
+        found: list[str] = []
+        for text in texts:
+            for url in self._URL_RE.findall(text):
+                if url not in found:
+                    found.append(url)
+        return found
+
+    def _learn_routes(self, command: str) -> None:
+        origins = self._service_origins()
+        if not origins:
+            return
+        with self.lock:
+            edits = list(self._recent_edit_paths)
+        if not edits:
+            return
+        recorded = False
+        for url in self._urls_in_command(command):
+            parts = urlparse(url)
+            origin = f"{parts.scheme}://{parts.netloc}"
+            if origin not in origins:
+                continue
+            route = parts.path or "/"
+            for path in edits:
+                with self.table_lock:
+                    self.table.record(f"editfile:{path}", f"route:{route}")
+                recorded = True
+                self._event("prewarm", f"🧭 gelernt: {path} → {route}")
+        if recorded:
+            # Attribution abgeschlossen: naechster Edit-Burst startet frisch.
+            with self.lock:
+                self._recent_edit_paths.clear()
+
+    def learned_routes_for(self, changed_path: str | None) -> list[str]:
+        if not changed_path:
+            return []
+        key = f"editfile:{_path_key(changed_path, self.workspace)}"
+        with self.table_lock:
+            candidates = [(nxt[len("route:"):], count)
+                          for (prev, nxt), count in self.table.counts.items()
+                          if prev == key and nxt.startswith("route:")]
+        candidates.sort(key=lambda item: -item[1])
+        return [route for route, _count in candidates[:3]]
 
     def _divert_external(self, tool: str, args: dict, reason: str) -> bool:
         """Externe Kommandos: Pre-Warming statt Result-Speculation.

@@ -174,6 +174,20 @@ warm_routes = ["/health", "auto"]
         finally:
             manager.stop_all()
 
+    def test_learned_routes_are_merged_into_auto(self):
+        manager = self._manager("mutation")
+        try:
+            manager.warm_after_mutation("components/Button.tsx",
+                                        learned_routes=["/learned"])
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if "/learned" in self._hit_lines():
+                    break
+                time.sleep(0.2)
+            self.assertIn("/learned", self._hit_lines())
+        finally:
+            manager.stop_all()
+
     def test_manual_service_is_never_booted_for_warming(self):
         manager = self._manager("manual")
         try:
@@ -183,6 +197,69 @@ warm_routes = ["/health", "auto"]
             self.assertEqual(self._hit_lines(), [])
         finally:
             manager.stop_all()
+
+
+class EngineRouteLearningTest(unittest.TestCase):
+    """Stufe 2: beobachtete URL nach Edit wird gelernt und danach vorgewaermt."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.workspace = self.tmp.name
+        os.environ["TOOLAHEAD_TRUST_FILE"] = os.path.join(
+            self.workspace, ".trust-store.json")
+        self.port = _free_port()
+        self.hits = os.path.join(self.workspace, "hits.log")
+        _write(os.path.join(self.workspace, "server.py"), RECORDING_SERVER)
+        _write(os.path.join(self.workspace, "e2e.sh"),
+               f"curl -sf http://127.0.0.1:{self.port}/pricing\n")
+        _write(os.path.join(self.workspace, "toolahead.toml"), f"""
+[services.web]
+command = "{sys.executable} server.py {self.port} hits.log"
+ready.port = {self.port}
+timeout = 10
+prewarm = "mutation"
+warm_routes = ["auto"]
+""")
+        trust_workspace(self.workspace)
+        from toolahead.proxy import PrefetchEngine
+        self.engine = PrefetchEngine(
+            self.workspace, os.path.join(self.workspace, ".pt.json"))
+
+    def tearDown(self):
+        self.engine.shutdown()
+        os.environ.pop("TOOLAHEAD_TRUST_FILE", None)
+        self.tmp.cleanup()
+
+    def _event(self, tool: str, tool_input: dict) -> None:
+        self.engine.handle_agent_event({
+            "hook_event_name": "PostToolUse", "session_id": "t",
+            "tool_name": tool, "tool_input": tool_input,
+            "tool_response": {"exit_code": 0},
+        })
+
+    def _hit_lines(self) -> list[str]:
+        if not os.path.exists(self.hits):
+            return []
+        with open(self.hits, encoding="utf-8") as handle:
+            return [line.strip() for line in handle if line.strip()]
+
+    def test_observed_url_is_learned_and_warmed_on_next_edit(self):
+        # components/Pricing.tsx trifft KEINE Framework-Heuristik — jede
+        # Vorwaermung von /pricing kann nur aus dem Lernen kommen.
+        self._event("Edit", {"file_path": "components/Pricing.tsx",
+                             "old_string": "a", "new_string": "b"})
+        self._event("Bash", {"command": "sh e2e.sh"})
+        self.assertEqual(
+            self.engine.learned_routes_for("components/Pricing.tsx"),
+            ["/pricing"])
+        self._event("Edit", {"file_path": "components/Pricing.tsx",
+                             "old_string": "b", "new_string": "c"})
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if "/pricing" in self._hit_lines():
+                break
+            time.sleep(0.2)
+        self.assertIn("/pricing", self._hit_lines())
 
 
 if __name__ == "__main__":

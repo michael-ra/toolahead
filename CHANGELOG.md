@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1 — 2026-08-07
+
+- Route warming now also learns: URLs the agent actually requests after
+  editing a file — extracted from its commands and the workspace shell
+  scripts they reference, for declared service origins only — are recorded
+  as file→route transitions and warmed via `"auto"` on the next edit of that
+  file. Learned transitions live in the existing transition table with the
+  same persistence and decay.
+
 ## 0.4.0 — 2026-08-07
 
 - Added route warming: `warm_routes = ["/", "auto"]` on a service GETs the

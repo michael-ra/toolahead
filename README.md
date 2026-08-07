@@ -361,7 +361,11 @@ With a trusted config:
   browser or e2e check arrives, the page is already compiled. The `"auto"`
   entry derives the route from the edited file for Next.js (app and pages
   router), Nuxt, and SvelteKit — editing `app/dashboard/page.tsx` warms
-  `/dashboard`. Warm requests are GET-only against the declared service
+  `/dashboard`. On top of the heuristic, ToolAhead learns which URLs your
+  agent actually requests after editing a file (from its commands and the
+  shell scripts they reference, for declared service origins only) and warms
+  those on the next edit too. Warm requests are GET-only against the declared
+  service
   origin, never follow redirects elsewhere, are never cached, and a newer
   edit supersedes an in-flight warm round.
 - Readiness means *reachable*, not "has processed your latest edit": a

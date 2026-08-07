@@ -610,18 +610,24 @@ class ServiceManager:
 
     # -------------------------------------------------------- Route-Warming
 
-    def warm_after_mutation(self, changed_path: str | None = None) -> None:
+    def warm_after_mutation(self, changed_path: str | None = None,
+                            learned_routes: list[str] | None = None) -> None:
         """Waermt deklarierte Routen nach einem Edit vor.
 
         Der GET selbst ist die Synchronisation mit dem Rebuild: Dev-Server
         wie Next/Vite kompilieren on demand und antworten erst, wenn der
         neue Stand steht. Es wird nie eine Antwort gecacht — reines Warming.
         ``"auto"`` in ``warm_routes`` aktiviert die Datei→Route-Heuristik
-        fuer den editierten Pfad.
+        fuer den editierten Pfad plus die vom Engine-Lernen beobachteten
+        Datei→Route-Transitionen (``learned_routes``).
         """
         if self._closed or not self.refresh_trust():
             return
         derived = derive_routes(changed_path)
+        for route in (learned_routes or []):
+            if isinstance(route, str) and route.startswith("/") \
+                    and route not in derived:
+                derived.append(route)
         for name, spec in self.specs.items():
             if not spec.warm_routes:
                 continue
