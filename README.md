@@ -22,7 +22,7 @@
     <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square&labelColor=111827">
     <img alt="Claude Code" src="https://img.shields.io/badge/Claude%20Code-supported-FFCC00?style=flat-square&labelColor=111827">
     <img alt="Codex CLI" src="https://img.shields.io/badge/Codex%20CLI-supported-FFCC00?style=flat-square&labelColor=111827">
-    <img alt="Antigravity" src="https://img.shields.io/badge/Antigravity-supported-FFCC00?style=flat-square&labelColor=111827">
+    <img alt="Antigravity" src="https://img.shields.io/badge/Antigravity-experimental-8b5cf6?style=flat-square&labelColor=111827">
     <img alt="MCP" src="https://img.shields.io/badge/MCP-native-8b5cf6?style=flat-square&labelColor=111827">
     <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square&labelColor=111827">
   </p>
@@ -148,7 +148,12 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:4242 claude
 
 Google Antigravity: open the project as usual — workspace MCP servers from
 `.agents/mcp_config.json` are discovered automatically. Run `/mcp` in the
-prompt panel once to confirm the `toolahead` server is enabled.
+prompt panel once to confirm the `toolahead` server is enabled. Antigravity
+support is currently **experimental**: the CLI registers workspace MCP tools
+lazily and its agents cannot always invoke them (observed on CLI 1.1.11), and
+its print mode does not load MCP servers at all. Discovery and the full
+ToolAhead tool chain have been verified; measured speedups so far are from
+Claude Code and Codex sessions.
 
 See live timing and cache statistics at any time:
 

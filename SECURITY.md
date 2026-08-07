@@ -14,3 +14,9 @@ workspace, but never from an untrusted file: they require a one-time
 outside the repository with mode 0600 and is revoked automatically by any
 change to the file, so a cloned repository cannot execute anything by merely
 being opened.
+
+The trust gate bounds configuration-driven execution, not an agent that
+already holds shell access: an agent with an unrestricted shell can start any
+process directly — including approving the trust file itself — so it gains
+nothing extra from `toolahead.toml`. Restricting what an agent may execute is
+the harness's permission system's job, not ToolAhead's.
