@@ -1,0 +1,2 @@
+# Tests run from the repository and CI, never from release archives.
+prune tests
