@@ -3,9 +3,10 @@
 
   <h3>Your agent's next tool call, already done.</h3>
 
-  <h3>28% faster agents — median of paired runs.</h3>
-
-  <p><strong>Finish faster. Wait less.</strong></p>
+  <p>
+    <strong>28% faster agents</strong> — median of paired runs.<br>
+    Finish faster. Wait less.
+  </p>
 
   <p>
     ToolAhead learns recurring tool sequences in a repository and starts safe,
