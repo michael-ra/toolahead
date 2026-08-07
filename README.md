@@ -116,10 +116,13 @@ Claude Code, or Google Antigravity installation. `watchdog` is optional.
 Run these commands inside the project you want to accelerate:
 
 ```bash
-# Connect both agents to ToolAhead and install the required hooks.
-uvx toolahead init --agent both --strict --project .
+# Connect your agents. The default is hooks-only: ToolAhead replaces
+# NOTHING — your agent keeps its native tools, and learning, service
+# pre-warming, route warming, and Bash replay all ride on lifecycle hooks.
+uvx toolahead init --agent both --project .
+# Want Read/Search replay hits too? --replay-tools registers the ToolAhead
+# MCP tools; --strict additionally hides the native analogs (maximum hits).
 # Google Antigravity user? Add --agent all, or run: uvx toolahead init-antigravity
-# (writes the workspace-local .agents/mcp_config.json Antigravity discovers)
 
 # Allow this exact test command to run ahead and be reused.
 uvx toolahead allow "python3 -m pytest" --project .
@@ -167,11 +170,14 @@ uvx toolahead status
 Rerun `toolahead init` after upgrading ToolAhead. It refreshes ToolAhead's
 project files without changing unrelated Codex, Claude, or MCP settings.
 
-## One clear set of tools
+## One clear set of tools (opt-in)
 
-ToolAhead gives the agent one consistent set of MCP tools. This lets it return
-prepared results directly instead of waiting for a native tool to run and then
-trying to replace its result afterward.
+The MCP tools are **opt-in** (`--replay-tools`). Everything except Read/Search
+replay works without them: lifecycle hooks observe the native tools, drive
+learning and pre-warming, and (on Claude Code and Codex) replay allowlisted
+Bash commands transparently. Registering the ToolAhead tools adds the one
+thing hooks cannot do — serving prepared file-read and search results — because
+only the tool that owns a call can answer it from memory.
 
 | MCP tool | Familiar input | Can run ahead | Behavior |
 | --- | --- | :---: | --- |
@@ -356,13 +362,12 @@ With a trusted config:
   they are warm when the test or e2e call arrives. `"start"` launches them with
   the daemon, `"manual"` only on demand.
 - A command matching a `[commands.*]` entry is **never** run ahead and never
-  served from cache, but it *is* allowed through the ToolAhead `run` tool
-  (execution opt-in, separate from the replay allowlist). Before executing,
-  the `run` tool waits — bounded by the declared timeouts — until every
-  required service passes its readiness check, and returns an actionable error
-  instead of a doomed run when a service stays down. Runs through the agent's
-  native shell get best-effort pre-warming only; the readiness guarantee
-  applies to the ToolAhead `run` tool.
+  served from cache. Before it executes, ToolAhead waits — bounded by the
+  declared timeouts — until every required service passes its readiness
+  check: through the ToolAhead `run` tool, and equally for the agent's
+  *native* shell via the PreToolUse hooks, which deny with an actionable
+  reason instead of allowing a doomed run when a trusted config's service
+  stays down. Everything else stays fail-open.
 - `warm_routes` goes one step further: after every edit, ToolAhead GETs the
   listed routes as soon as the service is ready. Dev servers compile routes on
   demand, so the request itself absorbs the rebuild — by the time the agent's

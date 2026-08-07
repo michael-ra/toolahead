@@ -33,6 +33,36 @@ TICKET_DIR = os.environ.get("TOOLAHEAD_TICKET_DIR",
                             os.path.dirname(REPLAY_SCRIPT))
 TICKET_RE = re.compile(r"\.prefetch-ticket-([A-Za-z0-9_-]+)\.json")
 TICKET_MAX_AGE = float(os.environ.get("TOOLAHEAD_TICKET_MAX_AGE", "600"))
+ENSURE_URL = f"{BASE_URL}/__prefetch/ensure-services"
+
+
+def _ensure_deny_reason(command: str, cwd: str) -> str:
+    """Blockierend auf deklarierte Services warten; Grund nur bei hartem Fail.
+
+    Fail-open in jede andere Richtung: kein toolahead.toml, Daemon down,
+    untrusted, kein deklariertes Kommando → leerer String (Call laeuft
+    normal). ``TOOLAHEAD_ENSURE_WAIT=0`` schaltet das Warten komplett ab."""
+    try:
+        wait = float(os.environ.get("TOOLAHEAD_ENSURE_WAIT", "45"))
+    except ValueError:
+        wait = 45.0
+    if wait <= 0 or not os.path.exists(os.path.join(cwd, "toolahead.toml")):
+        return ""
+    try:
+        result = _post(ENSURE_URL, {"command": command}, timeout=wait)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not isinstance(result, dict) or not result.get("ok"):
+        return ""
+    services = result.get("services") or {}
+    if services and result.get("trusted") and not result.get("ready"):
+        bad = ", ".join(f"{name}={state}"
+                        for name, state in sorted(services.items())
+                        if state != "ready")
+        return (f"declared service(s) not ready: {bad}. This command requires "
+                "them (toolahead.toml). Check the logs under "
+                ".toolahead/services/, fix the service, then retry.")
+    return ""
 
 
 def _strict_mcp_enabled() -> bool:
@@ -184,6 +214,17 @@ def main() -> int:
         return 0
     original = tool_input.get("command")
     if not isinstance(original, str) or not original.strip():
+        return 0
+
+    deny = _ensure_deny_reason(original, event.get("cwd") or os.getcwd())
+    if deny:
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": deny,
+            }
+        }))
         return 0
 
     try:

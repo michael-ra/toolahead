@@ -74,6 +74,96 @@ class FailOpenOutputTest(unittest.TestCase):
         self.assertEqual(self._run(payload.encode()), "{}")
 
 
+class EnsureDenyTest(unittest.TestCase):
+    """Hook-Ensure: blockierend warten, deny nur bei hartem Not-Ready."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.workspace = self.tmp.name
+        os.environ["TOOLAHEAD_TRUST_FILE"] = os.path.join(
+            self.workspace, ".trust-store.json")
+        self.httpd = None
+        self.engine = None
+
+    def tearDown(self):
+        if self.engine is not None:
+            self.engine.shutdown()
+        if self.httpd is not None:
+            self.httpd.shutdown()
+        os.environ.pop("TOOLAHEAD_TRUST_FILE", None)
+        self.tmp.cleanup()
+
+    def _daemon(self, toml: str, trust: bool = True) -> str:
+        with open(os.path.join(self.workspace, "toolahead.toml"), "w") as fh:
+            fh.write(toml)
+        if trust:
+            from toolahead.services import trust_workspace
+            trust_workspace(self.workspace)
+        import socket
+        import threading
+        from toolahead.proxy import build
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        self.httpd, _proxy, self.engine = build(
+            port=port, workspace=self.workspace,
+            table=os.path.join(self.workspace, ".pt.json"))
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        return f"http://127.0.0.1:{port}"
+
+    def test_ready_service_allows(self):
+        from toolahead.antigravity_hook import ensure_deny_reason
+        url = self._daemon("""
+[services.dev]
+command = "sleep 60"
+prewarm = "manual"
+timeout = 5
+
+[commands.e2e]
+match = "sh e2e.sh"
+requires = ["dev"]
+""")
+        self.assertEqual(
+            ensure_deny_reason("sh e2e.sh", self.workspace, url), "")
+        self.assertEqual(
+            self.engine.services.status()["dev"]["state"], "ready")
+
+    def test_not_ready_service_denies_with_reason(self):
+        from toolahead.antigravity_hook import ensure_deny_reason
+        url = self._daemon("""
+[services.dev]
+command = "sleep 60"
+ready.port = 1
+timeout = 1
+prewarm = "manual"
+
+[commands.e2e]
+match = "sh e2e.sh"
+requires = ["dev"]
+""")
+        reason = ensure_deny_reason("sh e2e.sh", self.workspace, url)
+        self.assertIn("not ready", reason)
+        self.assertIn("dev=", reason)
+
+    def test_untrusted_and_undeclared_stay_fail_open(self):
+        from toolahead.antigravity_hook import ensure_deny_reason
+        url = self._daemon("""
+[services.dev]
+command = "sleep 60"
+ready.port = 1
+timeout = 1
+prewarm = "manual"
+
+[commands.e2e]
+match = "sh e2e.sh"
+requires = ["dev"]
+""", trust=False)
+        self.assertEqual(
+            ensure_deny_reason("sh e2e.sh", self.workspace, url), "")
+        self.assertEqual(
+            ensure_deny_reason("echo hi", self.workspace, url), "")
+
+
 class EngineWiringTest(unittest.TestCase):
     def test_adapter_event_advances_mutation_generation(self):
         tmp = tempfile.TemporaryDirectory()

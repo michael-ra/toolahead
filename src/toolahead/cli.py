@@ -57,7 +57,7 @@ def _merge_codex_hooks(config: dict, command: str) -> dict:
         "PreToolUse": _group(
             command, matcher="Bash|apply_patch"),
         "PostToolUse": _group(
-            command, matcher="Bash|apply_patch"),
+            command, matcher="Bash|apply_patch", timeout=90),
         "Stop": _group(command),
         # Codex clamps SessionEnd hooks to at most three seconds.
         "SessionEnd": _group(command, timeout=3),
@@ -126,16 +126,49 @@ def _merge_managed_toml(existing: str, block: str) -> str:
     return merged.rstrip() + "\n"
 
 
+def _replay_enabled(args) -> bool:
+    """MCP-Tool-Ersatz ist Opt-in; --strict impliziert ihn."""
+    return bool(getattr(args, "replay_tools", False)
+                or getattr(args, "strict", False))
+
+
+def _remove_managed_toml(existing: str) -> str:
+    if MCP_BEGIN not in existing:
+        return existing
+    start = existing.index(MCP_BEGIN)
+    end = existing.index(MCP_END, start) + len(MCP_END) \
+        if MCP_END in existing[start:] else len(existing)
+    stripped = (existing[:start].rstrip() + "\n" + existing[end:].lstrip())
+    return stripped.strip() + "\n" if stripped.strip() else ""
+
+
 def _merge_claude_hook(config: dict, command: str) -> dict:
+    """Registriert den ToolAhead-Hook fuer Events und raeumt alte Eintraege.
+
+    PreToolUse Bash traegt Ensure-Wartezeit fuer deklarierte Services und
+    Replay — deshalb das grosse Timeout. PostToolUse liefert das
+    authoritative Lern- und Mutations-Signal fuer native Tools, damit
+    Pre-Warming auch ohne die ToolAhead-MCP-Tools funktioniert.
+    """
     hooks = config.setdefault("hooks", {})
-    existing = hooks.setdefault("PreToolUse", [])
-    existing[:] = [
-        item for item in existing
-        if not (isinstance(item, dict) and any(
-            isinstance(hook, dict) and hook.get("statusMessage") == "ToolAhead"
-            for hook in item.get("hooks", [])))
-    ]
-    existing.append(_group(command, matcher="Bash", timeout=10))
+    wanted = {
+        "PreToolUse": _group(command, matcher="Bash", timeout=90),
+        "PostToolUse": _group(
+            command, matcher="Bash|Edit|Write|MultiEdit|NotebookEdit|"
+                             "Read|Grep|Glob", timeout=10),
+        "UserPromptSubmit": _group(command, timeout=5),
+        "Stop": _group(command, timeout=5),
+    }
+    for event, group in wanted.items():
+        existing = hooks.setdefault(event, [])
+        existing[:] = [
+            item for item in existing
+            if not (isinstance(item, dict) and any(
+                isinstance(hook, dict)
+                and hook.get("statusMessage") == "ToolAhead"
+                for hook in item.get("hooks", [])))
+        ]
+        existing.append(group)
     return config
 
 
@@ -180,11 +213,15 @@ def init_codex(args) -> int:
         config = {"description": "ToolAhead Codex lifecycle integration."}
     merged = _merge_codex_hooks(config, command)
     payload = json.dumps(merged, indent=2, ensure_ascii=False) + "\n"
+    replay_tools = _replay_enabled(args)
     try:
         existing_toml = mcp_config.read_text(encoding="utf-8") \
             if mcp_config.exists() else ""
-        mcp_payload = _merge_managed_toml(
-            existing_toml, _codex_mcp_block(project, installed_mcp, url))
+        if replay_tools:
+            mcp_payload = _merge_managed_toml(
+                existing_toml, _codex_mcp_block(project, installed_mcp, url))
+        else:
+            mcp_payload = _remove_managed_toml(existing_toml)
     except (OSError, ValueError) as exc:
         print(f"Cannot merge {mcp_config}: {exc}", file=sys.stderr)
         return 2
@@ -201,14 +238,18 @@ def init_codex(args) -> int:
         marker.write_text("strict MCP routing enabled\n", encoding="utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(payload, encoding="utf-8")
-    mcp_config.write_text(mcp_payload, encoding="utf-8")
+    if mcp_payload or mcp_config.exists():
+        mcp_config.write_text(mcp_payload, encoding="utf-8")
     replay = project / ".prefetch-replay.json"
     if not replay.exists():
         replay.write_text('{\n  "commands": []\n}\n', encoding="utf-8")
     print(f"Installed Codex hooks: {path}")
-    print(f"Installed Codex MCP:   {mcp_config}")
+    if replay_tools:
+        print(f"Installed Codex MCP:   {mcp_config}")
+    else:
+        print("MCP replay tools:      off (hooks-only; add --replay-tools "
+              "for Read/Search replay)")
     print(f"Hook runtime:          {hook_dir}")
-    print(f"MCP runtime:           {installed_mcp.parent}")
     print(f"Replay allowlist:       {replay}")
     if getattr(args, "strict", False):
         print("Routing:                strict (ToolAhead file tools preferred)")
@@ -233,6 +274,7 @@ def init_claude(args) -> int:
             raise ValueError("top-level JSON value must be an object")
         return value
 
+    replay_tools = _replay_enabled(args)
     try:
         settings = _merge_claude_hook(load_object(settings_path), hook_command)
         if getattr(args, "strict", False):
@@ -245,17 +287,20 @@ def init_claude(args) -> int:
     if not isinstance(servers, dict):
         print(f"'mcpServers' must be an object in {mcp_path}", file=sys.stderr)
         return 2
-    servers["toolahead"] = {
-        "type": "stdio",
-        "command": "python3",
-        "args": [str(installed_mcp), "--workspace", str(project),
-                 "--url", url],
-        # The MCP server observes the actual tool completion, unlike the SSE
-        # stream which only contains the model's requested tool call. Keep
-        # lifecycle events enabled so successful Edit/Write calls can advance
-        # latest-mutation-wins generations authoritatively.
-        "env": {"TOOLAHEAD_MCP_EVENTS": "1"},
-    }
+    if replay_tools:
+        servers["toolahead"] = {
+            "type": "stdio",
+            "command": "python3",
+            "args": [str(installed_mcp), "--workspace", str(project),
+                     "--url", url],
+            # The MCP server observes the actual tool completion, unlike the
+            # SSE stream which only contains the model's requested tool call.
+            # Keep lifecycle events enabled so successful Edit/Write calls can
+            # advance latest-mutation-wins generations authoritatively.
+            "env": {"TOOLAHEAD_MCP_EVENTS": "1"},
+        }
+    else:
+        servers.pop("toolahead", None)
     settings_payload = json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
     mcp_payload = json.dumps(mcp, indent=2, ensure_ascii=False) + "\n"
     if args.dry_run:
@@ -267,13 +312,17 @@ def init_claude(args) -> int:
     shutil.copy2(REPLAY_HELPER, runtime / "prefetch_replay.py")
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(settings_payload, encoding="utf-8")
-    mcp_path.write_text(mcp_payload, encoding="utf-8")
+    if servers or mcp_path.exists():
+        mcp_path.write_text(mcp_payload, encoding="utf-8")
     replay = project / ".prefetch-replay.json"
     if not replay.exists():
         replay.write_text('{\n  "commands": []\n}\n', encoding="utf-8")
     print(f"Installed Claude hooks: {settings_path}")
-    print(f"Installed Claude MCP:   {mcp_path}")
-    print(f"MCP runtime:            {installed_mcp.parent}")
+    if replay_tools:
+        print(f"Installed Claude MCP:   {mcp_path}")
+    else:
+        print("MCP replay tools:       off (hooks-only; add --replay-tools "
+              "for Read/Search replay)")
     print(f"Replay allowlist:       {replay}")
     if getattr(args, "strict", False):
         print("Routing:                strict (native Read/Grep/Glob/Edit/Write hidden)")
@@ -302,6 +351,7 @@ def init_antigravity(args) -> int:
             raise ValueError("top-level JSON value must be an object")
         return value
 
+    replay_tools = _replay_enabled(args)
     try:
         mcp = load_object(mcp_path)
     except (OSError, ValueError) as exc:
@@ -312,21 +362,24 @@ def init_antigravity(args) -> int:
     if not isinstance(servers, dict):
         print(f"'mcpServers' must be an object in {mcp_path}", file=sys.stderr)
         return 2
-    servers["toolahead"] = {
-        "command": "python3",
-        "args": [str(installed_mcp), "--workspace", str(project),
-                 "--url", url],
-        "env": {"TOOLAHEAD_MCP_EVENTS": "1"},
-    }
+    if replay_tools:
+        servers["toolahead"] = {
+            "command": "python3",
+            "args": [str(installed_mcp), "--workspace", str(project),
+                     "--url", url],
+            "env": {"TOOLAHEAD_MCP_EVENTS": "1"},
+        }
+    else:
+        servers.pop("toolahead", None)
     hooks_path = project / ".agents" / "hooks.json"
     installed_hook = runtime / "antigravity_hook.py"
 
-    def _hook_group(event: str, matcher: str) -> list:
+    def _hook_group(event: str, matcher: str, timeout: int = 5) -> list:
         command = shlex.join(["python3", str(installed_hook), event,
                               "--url", url])
         return [{"matcher": matcher,
                  "hooks": [{"type": "command", "command": command,
-                            "timeout": 5}]}]
+                            "timeout": timeout}]}]
 
     try:
         hooks = load_object(hooks_path)
@@ -335,7 +388,10 @@ def init_antigravity(args) -> int:
               file=sys.stderr)
         return 2
     hooks["toolahead"] = {
-        "PreToolUse": _hook_group("PreToolUse", ANTIGRAVITY_TOOL_MATCHER),
+        # PreToolUse wartet bei deklarierten Kommandos blockierend auf
+        # Service-Readiness — deshalb das grosse Timeout.
+        "PreToolUse": _hook_group("PreToolUse", ANTIGRAVITY_TOOL_MATCHER,
+                                  timeout=120),
         "PostToolUse": _hook_group("PostToolUse", ANTIGRAVITY_TOOL_MATCHER),
         "Stop": _hook_group("Stop", "*"),
     }
@@ -348,18 +404,22 @@ def init_antigravity(args) -> int:
     _install_mcp_runtime(project)
     shutil.copy2(ANTIGRAVITY_HOOK, installed_hook)
     mcp_path.parent.mkdir(parents=True, exist_ok=True)
-    mcp_path.write_text(mcp_payload, encoding="utf-8")
+    if servers or mcp_path.exists():
+        mcp_path.write_text(mcp_payload, encoding="utf-8")
     hooks_path.write_text(hooks_payload, encoding="utf-8")
     replay = project / ".prefetch-replay.json"
     if not replay.exists():
         replay.write_text('{\n  "commands": []\n}\n', encoding="utf-8")
-    print(f"Installed Antigravity MCP:   {mcp_path}")
     print(f"Installed Antigravity hooks: {hooks_path}")
+    if replay_tools:
+        print(f"Installed Antigravity MCP:   {mcp_path}")
+        print("Run /mcp once in the prompt panel to confirm toolahead is "
+              "enabled.")
+    else:
+        print("MCP replay tools:            off (hooks-only; add "
+              "--replay-tools for Read/Search replay)")
     print(f"Runtime:                     {installed_mcp.parent}")
     print(f"Replay allowlist:            {replay}")
-    print("Antigravity reads workspace servers from .agents/mcp_config.json "
-          "and hooks from .agents/hooks.json; run /mcp once in the prompt "
-          "panel to confirm toolahead is enabled.")
     return 0
 
 
@@ -545,8 +605,12 @@ def build_parser() -> argparse.ArgumentParser:
     init_cmd.add_argument("--project", default=os.getcwd())
     init_cmd.add_argument("--url", default=DEFAULT_URL)
     init_cmd.add_argument("--dry-run", action="store_true")
+    init_cmd.add_argument("--replay-tools", action="store_true",
+                          help="also register the ToolAhead MCP tools for "
+                               "Read/Search replay hits")
     init_cmd.add_argument("--strict", action="store_true",
-                          help="route file tools through ToolAhead MCP")
+                          help="route file tools through ToolAhead MCP "
+                               "(implies --replay-tools)")
     init_cmd.set_defaults(func=init_codex)
 
     init_claude_cmd = sub.add_parser(
@@ -554,28 +618,41 @@ def build_parser() -> argparse.ArgumentParser:
     init_claude_cmd.add_argument("--project", default=os.getcwd())
     init_claude_cmd.add_argument("--url", default=DEFAULT_URL)
     init_claude_cmd.add_argument("--dry-run", action="store_true")
+    init_claude_cmd.add_argument("--replay-tools", action="store_true",
+                                 help="also register the ToolAhead MCP tools "
+                                      "for Read/Search replay hits")
     init_claude_cmd.add_argument("--strict", action="store_true",
-                                 help="hide native file-tool analogs")
+                                 help="hide native file-tool analogs "
+                                      "(implies --replay-tools)")
     init_claude_cmd.set_defaults(func=init_claude)
 
     init_ag_cmd = sub.add_parser(
         "init-antigravity",
-        help="install workspace-local MCP config for Google Antigravity")
+        help="install workspace-local hooks (and optional MCP tools) for "
+             "Google Antigravity")
     init_ag_cmd.add_argument("--project", default=os.getcwd())
     init_ag_cmd.add_argument("--url", default=DEFAULT_URL)
     init_ag_cmd.add_argument("--dry-run", action="store_true")
+    init_ag_cmd.add_argument("--replay-tools", action="store_true",
+                             help="also register the ToolAhead MCP tools for "
+                                  "Read/Search replay hits")
     init_ag_cmd.set_defaults(func=init_antigravity)
 
     init_all_cmd = sub.add_parser(
-        "init", help="install ToolAhead MCP and hooks for your agents")
+        "init", help="install ToolAhead hooks (default) and optional MCP "
+                     "tools for your agents")
     init_all_cmd.add_argument("--project", default=os.getcwd())
     init_all_cmd.add_argument("--url", default=DEFAULT_URL)
     init_all_cmd.add_argument(
         "--agent", choices=("both", "all", "codex", "claude", "antigravity"),
         default="both")
     init_all_cmd.add_argument("--dry-run", action="store_true")
+    init_all_cmd.add_argument("--replay-tools", action="store_true",
+                              help="also register the ToolAhead MCP tools "
+                                   "for Read/Search replay hits")
     init_all_cmd.add_argument("--strict", action="store_true",
-                              help="install coherent ToolAhead file-tool routing")
+                              help="install coherent ToolAhead file-tool "
+                                   "routing (implies --replay-tools)")
     init_all_cmd.set_defaults(func=init_all)
 
     trust_cmd = sub.add_parser(

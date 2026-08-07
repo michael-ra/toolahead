@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.0 — 2026-08-07
+
+- Hooks-only is the new default: `toolahead init` now replaces nothing — the
+  agent keeps its native tools, and learning, service pre-warming, route
+  warming, and transparent Bash replay all ride on lifecycle hooks. The
+  ToolAhead MCP tools (Read/Search replay hits) became an explicit opt-in via
+  `--replay-tools`; `--strict` implies it. Re-running `init` without the flag
+  removes a previous registration.
+- Claude Code hooks now report native tool events (PostToolUse,
+  UserPromptSubmit, Stop), so mutations and learning no longer depend on the
+  MCP tools or the API proxy.
+- The readiness guarantee for declared external commands moved into the
+  PreToolUse hooks of all three agents: before a matching native shell
+  command runs, the hook waits — bounded by the declared timeouts — for the
+  required services, and denies with an actionable reason only when a
+  trusted config's service stays down. Everything else stays fail-open, and
+  `TOOLAHEAD_ENSURE_WAIT=0` disables the wait.
+
 ## 0.5.0 — 2026-08-07
 
 - Added Antigravity lifecycle hooks: `init-antigravity` now also installs

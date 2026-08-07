@@ -16,6 +16,7 @@ weil Antigravity ihn nicht im Payload mitschickt.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.request
 
@@ -90,6 +91,41 @@ def build_event(event_name: str, payload: dict) -> dict | None:
     return event
 
 
+def ensure_deny_reason(command: str, workspace: str, url: str) -> str:
+    """Blockierend auf deklarierte Services warten; Grund nur bei hartem Fail.
+
+    Fail-open in jede andere Richtung: kein toolahead.toml, Daemon down,
+    untrusted, kein deklariertes Kommando → leerer String (Call laeuft
+    normal). ``TOOLAHEAD_ENSURE_WAIT=0`` schaltet das Warten komplett ab."""
+    try:
+        wait = float(os.environ.get("TOOLAHEAD_ENSURE_WAIT", "45"))
+    except ValueError:
+        wait = 45.0
+    if wait <= 0 or not workspace \
+            or not os.path.exists(os.path.join(workspace, "toolahead.toml")):
+        return ""
+    try:
+        request = urllib.request.Request(
+            url.rstrip("/") + "/__prefetch/ensure-services", method="POST",
+            data=json.dumps({"command": command}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=wait) as response:
+            result = json.loads(response.read())
+    except Exception:  # noqa: BLE001
+        return ""
+    if not isinstance(result, dict) or not result.get("ok"):
+        return ""
+    services = result.get("services") or {}
+    if services and result.get("trusted") and not result.get("ready"):
+        bad = ", ".join(f"{name}={state}"
+                        for name, state in sorted(services.items())
+                        if state != "ready")
+        return (f"declared service(s) not ready: {bad}. This command requires "
+                "them (toolahead.toml). Check the logs under "
+                ".toolahead/services/, fix the service, then retry.")
+    return ""
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     event_name = argv[0] if argv else "PostToolUse"
@@ -99,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
             url = argv[argv.index("--url") + 1]
         except IndexError:
             pass
+    output = "{}"
     try:
         payload = json.load(sys.stdin)
         if not isinstance(payload, dict):
@@ -110,11 +147,19 @@ def main(argv: list[str] | None = None) -> int:
                 data=json.dumps(event, separators=(",", ":")).encode(),
                 headers={"Content-Type": "application/json"})
             urllib.request.urlopen(request, timeout=0.8).read()
+        if event is not None and event_name == "PreToolUse" \
+                and event.get("tool_name") == "Bash":
+            paths = payload.get("workspacePaths") or []
+            workspace = paths[0] if paths and isinstance(paths[0], str) else ""
+            reason = ensure_deny_reason(
+                event["tool_input"].get("command", ""), workspace, url)
+            if reason:
+                output = json.dumps({"decision": "deny", "reason": reason})
     except Exception:  # noqa: BLE001 — Hooks duerfen NIE blockieren
-        pass
-    # Immer eine gueltige, neutrale Antwort — sonst kann Antigravity den
-    # eigentlichen Tool-Call verweigern.
-    sys.stdout.write("{}\n")
+        output = "{}"
+    # Immer eine gueltige Antwort — sonst kann Antigravity den eigentlichen
+    # Tool-Call verweigern.
+    sys.stdout.write(output + "\n")
     return 0
 
 
