@@ -130,6 +130,28 @@ def main():
                       f"lead {ms(item.get('prefetch_lead_ms')).strip()} · "
                       f"saved {ms(item.get('measured_tool_saved_ms')).strip()}")
 
+    services = data.get("services", {})
+    if services:
+        print("├─ Services (Pre-Warming) " + "─" * 39)
+        if cfg.get("services_trusted") is False:
+            print("│  ⚠ toolahead.toml nicht freigegeben — Services starten "
+                  "erst nach `toolahead trust`")
+        icons = {"ready": "✓", "starting": "…", "stopped": "·",
+                 "exited": "✗", "disabled": "⊘", "untrusted": "⚠"}
+        for name, info in sorted(services.items()):
+            state = str(info.get("state", "?"))
+            pid = info.get("pid")
+            check = info.get("ready_check") or "process"
+            detail = f"pid {pid}" if pid else \
+                f"{info.get('failures', 0)} Fehlstart(s)" \
+                if info.get("failures") else "aus"
+            print(f"│  {icons.get(state, '?')} {name:20} {state:9} · "
+                  f"prewarm={info.get('prewarm', '?'):8} · "
+                  f"ready={check:7} · {detail}")
+        if s.get("external_diverted"):
+            print(f"│  ≋ {s['external_diverted']}× externes Kommando → "
+                  "Pre-Warming statt Spekulation")
+
     per = data.get("per_tool", {})
     if per:
         print("├─ Pro Tool " + "─" * 54)

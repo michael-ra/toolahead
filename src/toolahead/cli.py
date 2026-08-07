@@ -21,6 +21,7 @@ CLAUDE_HOOK = ROOT / "prefetch_hook.py"
 REPLAY_HELPER = ROOT / "prefetch_replay.py"
 MCP_SERVER = ROOT / "mcp.py"
 TOOL_CONTRACTS = ROOT / "tool_contracts.py"
+SERVICES = ROOT / "services.py"
 STATS = ROOT / "prefetch_stats.py"
 DEFAULT_URL = "http://127.0.0.1:4242"
 MCP_BEGIN = "# >>> ToolAhead managed MCP >>>"
@@ -81,6 +82,7 @@ def _install_mcp_runtime(project: Path) -> Path:
     runtime.mkdir(parents=True, exist_ok=True)
     shutil.copy2(MCP_SERVER, installed_mcp)
     shutil.copy2(TOOL_CONTRACTS, runtime / "tool_contracts.py")
+    shutil.copy2(SERVICES, runtime / "services.py")
     return installed_mcp
 
 
@@ -312,6 +314,38 @@ def allow_command(args) -> int:
     return 0
 
 
+def trust(args) -> int:
+    from .services import ServiceManager, config_digest, trust_workspace
+
+    project = Path(args.project).resolve()
+    if config_digest(str(project)) is None:
+        print(f"No toolahead.toml found in {project}", file=sys.stderr)
+        return 2
+    warnings: list[str] = []
+    manager = ServiceManager.load(
+        str(project),
+        on_event=lambda kind, msg: warnings.append(msg)
+        if kind == "warn" and "ignoriert" in msg else None)
+    print(f"toolahead.toml in {project} declares:")
+    for name, spec in manager.specs.items():
+        check = spec.ready.kind if spec.ready else "process"
+        print(f"  service  {name:20} prewarm={spec.prewarm:8} ready={check}")
+        print(f"           $ {spec.command}")
+    for rule in manager.rules:
+        print(f"  command  {rule.match!r} requires {list(rule.requires)} "
+              "(never replayed/cached)")
+    for message in warnings:
+        print(f"  ⚠ {message}")
+    if not manager.specs and not manager.rules:
+        print("  (no valid services or commands)")
+    digest = trust_workspace(str(project))
+    print(f"\nTrusted this exact config (sha256 {digest[:16]}…). Service "
+          "commands above will run unsandboxed in this workspace. Any change "
+          "to toolahead.toml revokes this automatically — rerun "
+          "`toolahead trust` after editing it.")
+    return 0
+
+
 def serve(args) -> int:
     from . import proxy
 
@@ -438,6 +472,12 @@ def build_parser() -> argparse.ArgumentParser:
     init_all_cmd.add_argument("--strict", action="store_true",
                               help="install coherent ToolAhead file-tool routing")
     init_all_cmd.set_defaults(func=init_all)
+
+    trust_cmd = sub.add_parser(
+        "trust", help="approve this workspace's toolahead.toml for service "
+                      "pre-warming (revoked automatically on any change)")
+    trust_cmd.add_argument("--project", default=".")
+    trust_cmd.set_defaults(func=trust)
 
     allow_cmd = sub.add_parser("allow", help="allow one exact replay command")
     allow_cmd.add_argument("command")

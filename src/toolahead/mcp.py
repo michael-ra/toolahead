@@ -49,6 +49,11 @@ except ImportError:  # copied project-local MCP runtime
         visible_text,
     )
 
+try:
+    from .services import ServiceManager
+except ImportError:  # copied project-local MCP runtime
+    from services import ServiceManager
+
 
 VERSION = "0.2.0a2"
 DEFAULT_URL = "http://127.0.0.1:4242"
@@ -70,8 +75,10 @@ LIST_DESCRIPTION = (
 )
 RUN_DESCRIPTION = (
     "Run an exact deterministic test, build, or lint command that is listed in "
-    ".prefetch-replay.json. ToolAhead may replay an identical prefetched result; "
-    "use the agent's native shell for commands that are not explicitly opted in."
+    ".prefetch-replay.json. ToolAhead may replay an identical prefetched result. "
+    "Commands declared under [commands] in toolahead.toml also run here: their "
+    "required services are started and health-checked first (never replayed). "
+    "Use the agent's native shell for commands that are neither."
 )
 EDIT_DESCRIPTION = (
     "Replace an exact string in a workspace text file. Use this ToolAhead edit "
@@ -300,9 +307,15 @@ class ToolAheadMCP:
         self.replay_wait = max(0.1, replay_wait)
         self.command_timeout = max(0.1, command_timeout)
         self.report_events = report_events
+        try:
+            self.ensure_wait = float(os.environ.get(
+                "TOOLAHEAD_ENSURE_WAIT", "45"))
+        except ValueError:
+            self.ensure_wait = 45.0
         self.session_id = f"mcp-{os.getpid()}-{secrets.token_hex(6)}"
         self.sequence = 0
         self.turn_started = False
+        self._services_cache: tuple[float, ServiceManager] | None = None
 
     def _request(self, path: str, payload: dict[str, Any], *,
                  timeout: float = 1.0) -> dict[str, Any]:
@@ -405,6 +418,39 @@ class ToolAheadMCP:
         return self._request("/__prefetch/lookup", payload,
                              timeout=max(1.0, self.lookup_wait + 0.75))
 
+    def _service_manager(self) -> ServiceManager | None:
+        """Lokal geparste toolahead.toml (mtime-gecacht), None ohne Config."""
+        path = os.path.join(self.workspace, "toolahead.toml")
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            self._services_cache = None
+            return None
+        if self._services_cache and self._services_cache[0] == mtime:
+            return self._services_cache[1]
+        manager = ServiceManager.load(self.workspace)
+        self._services_cache = (mtime, manager)
+        return manager
+
+    def _service_requirements(self, command: str) -> list[str]:
+        manager = self._service_manager()
+        return manager.requirements_for(command) if manager else []
+
+    def _ensure_services(self, command: str) -> dict[str, Any] | None:
+        """Deklarierte Prerequisites (toolahead.toml) vor dem echten Lauf
+        hochfahren; liefert die Ensure-Antwort des Daemons.
+
+        Strikt optional: ``TOOLAHEAD_ENSURE_WAIT=0`` schaltet das Warten
+        komplett ab, und jeder Fehler — Daemon down, Timeout — ist fail-open
+        (Rueckgabe ``None``): das Kommando laeuft dann einfach normal."""
+        if self.ensure_wait <= 0:
+            return None
+        try:
+            return self._request("/__prefetch/ensure-services",
+                                 {"command": command}, timeout=self.ensure_wait)
+        except Exception:  # noqa: BLE001
+            return None
+
     def _replay(self, token: str) -> dict[str, Any]:
         query = urllib.parse.urlencode({
             "token": token, "wait_timeout": self.replay_wait})
@@ -417,10 +463,17 @@ class ToolAheadMCP:
     def call_tool(self, tool_name: str,
                   arguments: dict[str, Any]) -> dict[str, Any]:
         tool, native_name, args = self._native(tool_name, arguments)
-        if tool == "bash" and not self._allowlisted(args["command"]):
-            raise ToolContractError(
-                "command is not replayable; add the exact safe test/lint command "
-                "with `toolahead allow` or use the agent's native shell")
+        required: list[str] = []
+        if tool == "bash":
+            # Zwei getrennte Opt-ins: Replay-Allowlist (Ergebnis wiederverwenden)
+            # und toolahead.toml-[commands] (ausfuehren mit Service-Ensure, aber
+            # NIE cachen/replayen — das Ergebnis haengt von Server-State ab).
+            required = self._service_requirements(args["command"])
+            if not required and not self._allowlisted(args["command"]):
+                raise ToolContractError(
+                    "command is not replayable; add the exact safe test/lint "
+                    "command with `toolahead allow`, declare it under [commands] "
+                    "in toolahead.toml, or use the agent's native shell")
 
         self.sequence += 1
         call_id = f"{self.session_id}-{self.sequence}"
@@ -428,8 +481,9 @@ class ToolAheadMCP:
         cache = "miss"
         outcome: ToolOutcome | None = None
         lookup_meta: dict[str, Any] = {}
+        notes: list[str] = []
         try:
-            if tool == "bash":
+            if tool == "bash" and not required:
                 hit = self._lookup(native_name, args, reserve=True, call_id=call_id)
                 token = hit.get("token")
                 if hit.get("hit") and isinstance(token, str) and token:
@@ -456,6 +510,45 @@ class ToolAheadMCP:
             # Daemon/cache failure is fail-open: this remains a normal MCP tool.
             pass
 
+        ensure: dict[str, Any] | None = None
+        if tool == "bash" and required:
+            ensure = self._ensure_services(args["command"])
+        if ensure is not None and ensure.get("ok"):
+            states = ensure.get("services") or {}
+            if not ensure.get("trusted", True):
+                notes.append(
+                    "[ToolAhead] toolahead.toml is not trusted yet, so required "
+                    f"service(s) {', '.join(required)} were neither started nor "
+                    "health-checked. Run `toolahead trust` once to enable "
+                    "managed pre-warming.")
+            elif not ensure.get("ready"):
+                bad = {name: state for name, state in states.items()
+                       if state != "ready"}
+                detail = ", ".join(f"{name}={state}"
+                                   for name, state in sorted(bad.items()))
+                exc = ToolContractError(
+                    f"declared service(s) not ready: {detail}. This command "
+                    f"requires {', '.join(required)} (toolahead.toml). Check "
+                    "the service logs under .toolahead/services/ before "
+                    "rerunning.")
+                self._event("PostToolUse", native_name, args, call_id,
+                            ToolOutcome(stderr=str(exc), exit_code=1))
+                raise exc
+            else:
+                age = ensure.get("last_mutation_age_s")
+                started_now = set(ensure.get("started_now") or [])
+                warm = [name for name in required if name not in started_now]
+                if warm and isinstance(age, (int, float)) and age < 3.0:
+                    # Freshness-Hinweis statt Barriere: kostet keine Latenz,
+                    # verhindert aber die Fehldiagnose "mein Edit hat nichts
+                    # geaendert", wenn ein Hot-Reload-Server noch nachzieht.
+                    notes.append(
+                        f"[ToolAhead] note: the workspace changed {age:.1f}s "
+                        f"ago and service(s) {', '.join(warm)} were already "
+                        "running — a hot-reload server may still serve the "
+                        "previous build. If this result looks unaffected by "
+                        "your edit, re-run once.")
+
         started = time.monotonic()
         try:
             if outcome is None:
@@ -473,8 +566,15 @@ class ToolAheadMCP:
             "direct_execution_s": round(elapsed, 6),
             **{key: value for key, value in lookup_meta.items() if value is not None},
         }
+        if required:
+            metadata["external"] = True
+            if ensure is not None and isinstance(ensure.get("services"), dict):
+                metadata["services"] = ensure["services"]
+        text = visible_text(tool, outcome)
+        if notes:
+            text = text.rstrip("\n") + "\n\n" + "\n".join(notes) + "\n"
         return {
-            "content": [{"type": "text", "text": visible_text(tool, outcome)}],
+            "content": [{"type": "text", "text": text}],
             "isError": False,
             "_meta": {"toolahead": {
                 **metadata,
@@ -502,9 +602,10 @@ class ToolAheadMCP:
                     "instructions": (
                         "Use ToolAhead read_file, search, and list_files for workspace "
                         "inspection; edit_file and write_file for file mutations; and run "
-                        "for opted-in test/lint commands. Inputs follow familiar coding-"
-                        "agent conventions. Cache hits and cold calls have the same visible "
-                        "output; mutations always execute normally and are never replayed."
+                        "for opted-in test/lint commands and commands declared in "
+                        "toolahead.toml. Inputs follow familiar coding-agent conventions. "
+                        "Cache hits and cold calls have the same visible output; mutations "
+                        "always execute normally and are never replayed."
                     ),
                 }
             elif method == "ping":

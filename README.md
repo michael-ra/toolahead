@@ -266,6 +266,90 @@ ToolAhead can learn and reuse that exact command normally. Focused modes such
 as `pytest --lf` or Jest `--onlyFailures` are useful quick checks, but ToolAhead
 never substitutes their partial result for a requested full-suite result.
 
+## Pre-warming external services (optional)
+
+ToolAhead accelerates two different things and never mixes them up:
+
+- **Result speculation** prepares an answer ahead of time. It is limited to
+  calls whose output is a pure function of the workspace files — List, Search,
+  Read, and allowlisted test commands — because the content hash proves the
+  result is identical.
+- **Pre-warming** starts slow, long-lived prerequisites ahead of time — a dev
+  server, a browser. No result is ever served from memory here; the win is
+  purely the eliminated startup latency.
+
+Commands whose output depends on a running service (Playwright against a dev
+server, integration tests against a database) belong to the second category: a
+file hash cannot prove their results equal, because server state — hot-reload
+timing included — is not stored in files. Declare them in an optional
+`toolahead.toml` at the workspace root:
+
+```toml
+[services.dev-server]
+command = "npm run dev"
+ready.port = 3000        # or ready.http = "http://…" / ready.command = "curl -sf …"
+timeout = 30             # seconds to wait for readiness (default 30)
+prewarm = "mutation"     # "mutation" (default) | "start" | "manual"
+
+[commands.e2e]
+match = "npx playwright test"   # prefix match on the exact command
+requires = ["dev-server"]
+```
+
+You can also let your agent draft this file — it already knows the project's
+dev-server command, ports, and test entry points, and writing the file is an
+ordinary edit. Nothing executes from it until you review and approve the exact
+content once:
+
+```bash
+toolahead trust
+```
+
+Service commands run unsandboxed against the live workspace — they *are* the
+environment the agent is about to test — so a cloned repository must never
+start anything by merely being opened. `toolahead trust` records a SHA-256 of
+the exact file outside the repository (mode 0600); **any** later change to
+`toolahead.toml` revokes the approval automatically until you rerun it. Until
+trusted, only the safe direction applies: declared external commands are still
+excluded from result reuse, but no process is ever started.
+
+To keep a service itself sandboxed, make the declared command the sandbox
+wrapper: `command = "docker compose up dev"` runs the dev server in a
+container with the workspace mounted read-only or read-write as you choose —
+isolation comes from the container, and `ready.port` works unchanged.
+
+With a trusted config:
+
+- Services with `prewarm = "mutation"` start right after the first successful
+  edit — typically while the model is still reasoning about its next step — so
+  they are warm when the test or e2e call arrives. `"start"` launches them with
+  the daemon, `"manual"` only on demand.
+- A command matching a `[commands.*]` entry is **never** run ahead and never
+  served from cache, but it *is* allowed through the ToolAhead `run` tool
+  (execution opt-in, separate from the replay allowlist). Before executing,
+  the `run` tool waits — bounded by the declared timeouts — until every
+  required service passes its readiness check, and returns an actionable error
+  instead of a doomed run when a service stays down. Runs through the agent's
+  native shell get best-effort pre-warming only; the readiness guarantee
+  applies to the ToolAhead `run` tool.
+- Readiness means *reachable*, not "has processed your latest edit": a
+  hot-reload server that was already running may briefly still serve the
+  previous build. ToolAhead never adds a wait for this — instead, when a run
+  starts within seconds of an edit against an already-running service, it
+  appends a short note to the output so the agent re-runs once instead of
+  concluding its change had no effect. For a strict freshness barrier, use
+  `ready.command` with a project-specific check (for example comparing a build
+  ID endpoint against the sources).
+- Browser-based checks follow the same rule: ToolAhead warms the browser and
+  the server, but a screenshot or page snapshot is always captured fresh —
+  rendered output is not a pure function of the files.
+
+Everything here is strictly opt-in: without `toolahead.toml` nothing starts and
+nothing changes. `TOOLAHEAD_ENSURE_WAIT=0` disables the bounded wait before
+real commands entirely. Service output is logged to
+`.toolahead/services/<name>.log`, and `toolahead status` shows each service's
+state.
+
 ## Latency metrics
 
 `toolahead status` separates the parts that can otherwise be confused:
@@ -296,10 +380,15 @@ independently.
 - Every command run ahead uses a fresh disposable copy, never the live
   checkout.
 - The local daemon binds to `127.0.0.1` and adds no remote telemetry.
+- Declared services never start from an untrusted `toolahead.toml`: approval
+  is an explicit `toolahead trust` of the exact file content, stored outside
+  the repository and revoked automatically by any change to the file.
 - Before returning a prepared result, ToolAhead hashes the current files again.
   Filesystem watchers only help it skip unnecessary hashing.
 - Tests that depend on external services, databases, clocks, random values, or
-  environment state cannot be validated from source files alone.
+  environment state cannot be validated from source files alone. Declare them
+  under `[commands]` in `toolahead.toml`: they are then excluded from result
+  reuse and only their prerequisites are pre-warmed.
 
 ## Limitations
 
@@ -314,6 +403,10 @@ independently.
   multiple runs with and without ToolAhead instead of relying on one attempt.
 - Hosted tools such as provider-side web search cannot be run ahead by this
   local integration.
+- Service readiness proves reachability, not that a hot-reload server has
+  finished rebuilding the newest edit. ToolAhead flags this window with a note
+  on the run output rather than adding latency; `ready.command` can implement
+  a strict project-specific freshness check.
 - Windows has not yet been validated.
 
 ## Development

@@ -19,7 +19,7 @@ import hashlib
 import os
 import threading
 
-IGNORE_DIRS = {"__pycache__", ".git", "node_modules", ".venv"}
+IGNORE_DIRS = {"__pycache__", ".git", "node_modules", ".venv", ".toolahead"}
 
 
 def _relevant_file(name: str) -> bool:

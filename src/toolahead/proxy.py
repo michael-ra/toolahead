@@ -44,6 +44,7 @@ from http.client import HTTPConnection, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from .services import ServiceManager
 from .speculator import Context, TransitionTable, parse_intents
 from .telemetry import LatencyTracker
 from .tool_contracts import (
@@ -329,6 +330,7 @@ class PrefetchEngine:
         # monotonic generation. Expensive work from older generations is
         # cancelled and its newest replacement is queued by exact command key.
         self.mutation_generation = 0
+        self.last_mutation_wall: float | None = None
         self.pending_restarts: dict[str, dict] = {}
         self.mutation_timers: dict[str, dict] = {}
         self.mutation_debounce_s = max(
@@ -365,10 +367,15 @@ class PrefetchEngine:
                       "mutations": 0, "superseded_runs": 0,
                       "superseded_s": 0.0, "mutation_restarts": 0,
                       "mutation_coalesced": 0,
-                      "replay_invalidated": 0}
+                      "replay_invalidated": 0,
+                      "external_diverted": 0}
         self.per_tool: dict[str, dict] = {}
         self.log: list[dict] = []
         self.t0 = time.monotonic()
+        # Pre-Warming ist strikt von der Result-Speculation getrennt: Services
+        # liefern nie gecachte Ergebnisse, nur eliminierte Startlatenz.
+        self.services = ServiceManager.load(self.workspace, on_event=self._event)
+        self.services.prewarm("start")
 
     def _load_replay_commands(self) -> set[str]:
         """Explizites Opt-in fuer Befehle, deren Seiteneffekte entbehrlich sind."""
@@ -564,7 +571,11 @@ class PrefetchEngine:
                 break
             visited.add(key)
             resolved = self.resolve_prediction(key, ctx)
-            if resolved is None or not self.allowed(*resolved)[0]:
+            if resolved is None:
+                break
+            if self._divert_external(resolved[0], resolved[1], reason):
+                break
+            if not self.allowed(*resolved)[0]:
                 break
             self.schedule(
                 *resolved,
@@ -622,6 +633,7 @@ class PrefetchEngine:
         cancelled = 0
         coalesced = 0
         with self.lock:
+            self.last_mutation_wall = time.monotonic()
             self.mutation_generation += 1
             generation = self.mutation_generation
             self.stats["mutations"] += 1
@@ -684,6 +696,9 @@ class PrefetchEngine:
         if coalesced:
             detail += f", {coalesced} Vorhersage(n) zusammengefasst"
         self._event("mutation", f"↻ Latest mutation wins: {detail}")
+        # Edits kuendigen typischerweise Test-/E2E-Laeufe an: deklarierte
+        # Services jetzt hochfahren, damit sie beim echten Call warm sind.
+        self.services.prewarm("mutation")
         return generation
 
     def handle_agent_event(self, event: dict) -> dict:
@@ -752,6 +767,10 @@ class PrefetchEngine:
             if call_id:
                 with self.lock:
                     state.pending[call_id] = (tool, args)
+            if tool == "bash":
+                # Letzte Chance vor einem nativen Lauf: deklarierte
+                # Prerequisites (falls noch kalt) asynchron hochfahren.
+                self.services.ensure_for(args.get("command", ""))
             return {"ok": True, **recorded, "tool": tool,
                     "label": annotated["label"]}
 
@@ -816,9 +835,32 @@ class PrefetchEngine:
             self.save()
         return {"ok": True, **recorded}
 
+    def _divert_external(self, tool: str, args: dict, reason: str) -> bool:
+        """Externe Kommandos: Pre-Warming statt Result-Speculation.
+
+        Ein per ``toolahead.toml`` deklariertes Kommando haengt von laufenden
+        Services ab. Sein Ergebnis ist keine reine Funktion der Dateien, also
+        wird es nie vorab ausgefuehrt oder gecacht — stattdessen werden die
+        deklarierten Prerequisites asynchron hochgefahren.
+        """
+        if tool != "bash" or not self.services.enabled:
+            return False
+        names = self.services.requirements_for(args.get("command", ""))
+        if not names:
+            return False
+        with self.lock:
+            self.stats["external_diverted"] += 1
+        self._event("prewarm",
+                    f"≋ extern: {exec_key(tool, args, self.workspace)} → "
+                    f"Pre-Warming {', '.join(names)} ({reason})")
+        self.services.ensure_async(names)
+        return True
+
     # -- Spekulative Ausführung (mit Erwartungswert-Gate) --
     def schedule(self, tool: str, args: dict, reason: str, confidence: float = 1.0,
                  meta: dict | None = None):
+        if self._divert_external(tool, args, reason):
+            return False
         ok, _why = self.allowed(tool, args)
         if not ok:
             return False
@@ -1110,7 +1152,8 @@ class PrefetchEngine:
         try:
             shutil.copytree(self.workspace, ws, symlinks=True,
                             ignore=shutil.ignore_patterns("__pycache__", ".git",
-                                                          ".prefetch*"))
+                                                          ".prefetch*",
+                                                          ".toolahead"))
             # Symlinks aus der Kopie duerfen nicht zurueck in den echten Workspace
             # oder an andere beschreibbare Orte zeigen. Sonst koennte ein Test trotz
             # kopiertem cwd reale Dateien mutieren.
@@ -1285,6 +1328,10 @@ class PrefetchEngine:
         # eigene strukturierte Ausgabeformen, die diese Demo nicht exakt ersetzt.
         if reserve and tool != "bash":
             return finish({"hit": False, "reason": "replay unsupported for this tool"})
+        if tool == "bash" and self.services.external(args.get("command", "")):
+            # Defense in depth: extern deklarierte Kommandos werden nie
+            # spekuliert, also kann hier auch nie ein Ergebnis liegen.
+            return finish({"hit": False, "reason": "external-state command"})
         ok, _why = self.allowed(tool, args)
         if not ok:
             return finish({"hit": False, "reason": "tool not safe for replay"})
@@ -1453,10 +1500,12 @@ class PrefetchEngine:
                                self.mutation_debounce_s * 1000),
                            "replay_commands": len(self.replay_commands),
                            "observed_models": sorted(self.observed_models),
+                           "services_trusted": self.services.trusted,
                            "workspace": self.workspace},
                 "watcher": {"backend": self.watcher.backend,
                             "generation": self.watcher.generation,
                             "role": "optimization-only"},
+                "services": self.services.status(),
                 "cache": [k[0] for k in self.cache],
                 "inflight": sorted(self.inflight),
                 "table": table_rows,
@@ -1484,6 +1533,7 @@ class PrefetchEngine:
             if isinstance(event, threading.Event):
                 event.set()
         self.watcher.stop()
+        self.services.stop_all()
         self.pool.shutdown(wait=True, cancel_futures=True)
 
 
@@ -1792,6 +1842,33 @@ def make_handler(proxy: Proxy, engine: PrefetchEngine):
                                                   meta=meta))
                 except Exception as e:  # noqa: BLE001
                     self._json(200, {"hit": False, "error": str(e)})
+                return
+            if path == "/__prefetch/ensure-services":
+                # Blockierend bis Readiness (bounded durch die deklarierten
+                # Service-Timeouts). Ohne Deklaration antwortet das sofort.
+                try:
+                    q = json.loads(body or b"{}")
+                    names = q.get("services")
+                    if isinstance(q.get("command"), str):
+                        names = engine.services.requirements_for(q["command"])
+                    names = [n for n in (names or []) if isinstance(n, str)]
+                    result = engine.services.ensure(names, report=True) \
+                        if names else {"states": {}, "started_now": []}
+                    states = result["states"]
+                    with engine.lock:
+                        last = engine.last_mutation_wall
+                    age = round(time.monotonic() - last, 3) \
+                        if last is not None else None
+                    self._json(200, {
+                        "ok": True,
+                        "ready": all(v == "ready" for v in states.values()),
+                        "trusted": engine.services.trusted,
+                        "services": states,
+                        "started_now": result["started_now"],
+                        "last_mutation_age_s": age,
+                    })
+                except Exception as e:  # noqa: BLE001
+                    self._json(200, {"ok": False, "error": str(e)})
                 return
             if path == "/__prefetch/agent-event":
                 try:
