@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1 — 2026-08-07
+
+- Fixed README images on PyPI by using absolute asset URLs, and added the
+  one-line install to the top of the README.
+
 ## 0.3.0 — 2026-08-07
 
 - Added optional service pre-warming via `toolahead.toml`: declared dev

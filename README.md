@@ -1,5 +1,5 @@
 <div align="center">
-  <img alt="ToolAhead" src="./docs/assets/toolahead-hero.svg" width="240">
+  <img alt="ToolAhead" src="https://raw.githubusercontent.com/michael-ra/toolahead/main/docs/assets/toolahead-hero.svg" width="240">
 
   <h3>Your agent's next tool call, already done.</h3>
 
@@ -7,6 +7,8 @@
     <strong>28% faster agents</strong> — median of paired runs.<br>
     Finish faster. Wait less.
   </p>
+
+  <p><code>uvx toolahead</code></p>
 
   <p>
     ToolAhead learns recurring tool sequences in a repository and starts safe,
@@ -56,7 +58,7 @@ into 0.45s. See
 ### Codex: the same task with and without ToolAhead
 
 <p align="center">
-  <img src="./docs/assets/toolahead-codex-speedup.gif"
+  <img src="https://raw.githubusercontent.com/michael-ra/toolahead/main/docs/assets/toolahead-codex-speedup.gif"
        alt="Codex CLI baseline versus ToolAhead synchronized real-run speed comparison"
        width="100%">
 </p>
@@ -73,7 +75,7 @@ search, read, edit, write, test, result validation, and reuse.
 #### Codex CLI
 
 <p align="center">
-  <img src="./docs/assets/toolahead-codex-live.gif"
+  <img src="https://raw.githubusercontent.com/michael-ra/toolahead/main/docs/assets/toolahead-codex-live.gif"
        alt="Real Codex CLI run using ToolAhead list, search, read, edit, and run tools"
        width="100%">
 </p>
@@ -81,7 +83,7 @@ search, read, edit, write, test, result validation, and reuse.
 #### Claude Code
 
 <p align="center">
-  <img src="./docs/assets/toolahead-claude-live.gif"
+  <img src="https://raw.githubusercontent.com/michael-ra/toolahead/main/docs/assets/toolahead-claude-live.gif"
        alt="Real Claude Code run using ToolAhead list, search, read, edit, and run tools"
        width="100%">
 </p>
