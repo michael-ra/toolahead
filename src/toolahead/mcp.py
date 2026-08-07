@@ -55,7 +55,7 @@ except ImportError:  # copied project-local MCP runtime
     from services import ServiceManager
 
 
-VERSION = "0.2.0a2"
+VERSION = "0.3.0"
 DEFAULT_URL = "http://127.0.0.1:4242"
 
 READ_DESCRIPTION = (

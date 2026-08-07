@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-08-07
 
 - Added optional service pre-warming via `toolahead.toml`: declared dev
   servers and other long-lived prerequisites start after the first successful
