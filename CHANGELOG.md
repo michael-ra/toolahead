@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0 — 2026-08-07
+
+- Added route warming: `warm_routes = ["/", "auto"]` on a service GETs the
+  listed routes after every edit once the service is ready, so on-demand
+  compiling dev servers (Next.js and friends) finish their rebuild before the
+  agent's browser or e2e check arrives. `"auto"` derives the route from the
+  edited file for Next.js (app and pages router), Nuxt, and SvelteKit.
+- Warm requests are GET-only against the declared service origin, never
+  follow redirects off it, never cache responses, and a newer edit
+  supersedes an in-flight warm round. Manual services are never booted just
+  for warming.
+
 ## 0.3.2 — 2026-08-07
 
 - Added Google Antigravity support: `toolahead init-antigravity` writes the

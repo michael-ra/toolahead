@@ -312,6 +312,7 @@ command = "npm run dev"
 ready.port = 3000        # or ready.http = "http://…" / ready.command = "curl -sf …"
 timeout = 30             # seconds to wait for readiness (default 30)
 prewarm = "mutation"     # "mutation" (default) | "start" | "manual"
+warm_routes = ["/", "auto"]  # optional: pre-request routes after every edit
 
 [commands.e2e]
 match = "npx playwright test"   # prefix match on the exact command
@@ -354,6 +355,15 @@ With a trusted config:
   instead of a doomed run when a service stays down. Runs through the agent's
   native shell get best-effort pre-warming only; the readiness guarantee
   applies to the ToolAhead `run` tool.
+- `warm_routes` goes one step further: after every edit, ToolAhead GETs the
+  listed routes as soon as the service is ready. Dev servers compile routes on
+  demand, so the request itself absorbs the rebuild — by the time the agent's
+  browser or e2e check arrives, the page is already compiled. The `"auto"`
+  entry derives the route from the edited file for Next.js (app and pages
+  router), Nuxt, and SvelteKit — editing `app/dashboard/page.tsx` warms
+  `/dashboard`. Warm requests are GET-only against the declared service
+  origin, never follow redirects elsewhere, are never cached, and a newer
+  edit supersedes an in-flight warm round.
 - Readiness means *reachable*, not "has processed your latest edit": a
   hot-reload server that was already running may briefly still serve the
   previous build. ToolAhead never adds a wait for this — instead, when a run

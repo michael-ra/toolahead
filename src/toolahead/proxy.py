@@ -620,7 +620,8 @@ class PrefetchEngine:
                 return False
         return True
 
-    def note_mutation(self, meta: dict | None = None) -> int:
+    def note_mutation(self, meta: dict | None = None,
+                      changed_path: str | None = None) -> int:
         """Advance the workspace generation and supersede older expensive work.
 
         The content hash remains the serving proof. The generation exists to
@@ -697,8 +698,10 @@ class PrefetchEngine:
             detail += f", {coalesced} Vorhersage(n) zusammengefasst"
         self._event("mutation", f"↻ Latest mutation wins: {detail}")
         # Edits kuendigen typischerweise Test-/E2E-Laeufe an: deklarierte
-        # Services jetzt hochfahren, damit sie beim echten Call warm sind.
+        # Services jetzt hochfahren, damit sie beim echten Call warm sind —
+        # und deklarierte Routen (inkl. Datei→Route-Heuristik) vorwaermen.
         self.services.prewarm("mutation")
+        self.services.warm_after_mutation(changed_path)
         return generation
 
     def handle_agent_event(self, event: dict) -> dict:
@@ -786,7 +789,8 @@ class PrefetchEngine:
             mutation_generation = None
             mutation_failed = tool == "edit" and not self._mutation_succeeded(event)
             if tool == "edit" and not mutation_failed:
-                mutation_generation = self.note_mutation(meta)
+                mutation_generation = self.note_mutation(
+                    meta, changed_path=args.get("path"))
             if tool == "grep":
                 response = event.get("tool_response")
                 if isinstance(response, dict):

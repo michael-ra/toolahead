@@ -46,6 +46,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -53,6 +54,7 @@ import threading
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -174,6 +176,58 @@ class ServiceSpec:
     timeout: float = 30.0
     prewarm: str = "mutation"
     cwd: str = "."
+    warm_routes: tuple[str, ...] = ()
+
+    def base_url(self) -> str | None:
+        """HTTP-Basis fuer Route-Warming, ableitbar aus dem Ready-Check."""
+        if self.ready is None:
+            return None
+        if self.ready.kind == "port":
+            return f"http://127.0.0.1:{self.ready.value}"
+        if self.ready.kind == "http":
+            parts = urllib.parse.urlsplit(str(self.ready.value))
+            if parts.scheme and parts.netloc:
+                return f"{parts.scheme}://{parts.netloc}"
+        return None
+
+
+# Datei→Route-Heuristik fuer file-based Routing. Dynamische Segmente
+# (``[slug]``) sind ohne konkrete Parameter nicht aufwaermbar und werden
+# uebersprungen; Route-Groups ``(group)`` verschwinden aus der URL.
+_PAGE_PATTERNS = (
+    re.compile(r"^(?:src/)?app/(?:(?P<route>.+)/)?page\.(?:jsx?|tsx?|mdx?)$"),
+    re.compile(r"^(?:src/)?pages/(?P<route>.+?)\.(?:jsx?|tsx?|vue|mdx?)$"),
+    re.compile(r"^src/routes/(?:(?P<route>.+)/)?\+page(?:@[^/]*)?\.svelte$"),
+)
+
+
+def derive_routes(path: str | None) -> list[str]:
+    """Leitet aus einem editierten Seiten-File die zugehoerige Route ab.
+
+    Unterstuetzt Next.js (app- und pages-Router, auch unter ``src/``), Nuxt
+    (``pages/*.vue``) und SvelteKit (``src/routes/**/+page.svelte``).
+    """
+    if not path:
+        return []
+    normalized = path.replace(os.sep, "/").lstrip("./")
+    for pattern in _PAGE_PATTERNS:
+        match = pattern.match(normalized)
+        if match is None:
+            continue
+        route = (match.group("route") or "").strip("/")
+        segments = []
+        for segment in route.split("/"):
+            if not segment or segment.startswith("(") and segment.endswith(")"):
+                continue
+            if segment.startswith("_") or segment == "api":
+                return []
+            if "[" in segment:  # dynamisches Segment: ohne Parameter kein Warm
+                return []
+            segments.append(segment)
+        if segments and segments[-1] == "index":
+            segments.pop()
+        return ["/" + "/".join(segments) if segments else "/"]
+    return []
 
 
 @dataclass(frozen=True)
@@ -204,6 +258,19 @@ def _parse_service(name: str, raw: object, workspace: str) -> ServiceSpec:
     if prewarm not in PREWARM_TRIGGERS:
         raise ServiceConfigError(
             f"prewarm muss eines von {PREWARM_TRIGGERS} sein, nicht {prewarm!r}")
+    warm_routes = raw.get("warm_routes", [])
+    if not isinstance(warm_routes, list) \
+            or not all(isinstance(item, str) for item in warm_routes):
+        raise ServiceConfigError("warm_routes muss eine Liste von Strings sein")
+    for item in warm_routes:
+        if item != "auto" and not item.startswith("/"):
+            raise ServiceConfigError(
+                f"warm_routes-Eintrag muss mit / beginnen oder 'auto' sein: "
+                f"{item!r}")
+    ready = ReadyCheck.parse(raw.get("ready"))
+    if warm_routes and (ready is None or ready.kind == "command"):
+        raise ServiceConfigError(
+            "warm_routes braucht ready.port oder ready.http als URL-Basis")
     cwd = raw.get("cwd", ".")
     if not isinstance(cwd, str):
         raise ServiceConfigError(f"cwd ungueltig: {cwd!r}")
@@ -215,9 +282,9 @@ def _parse_service(name: str, raw: object, workspace: str) -> ServiceSpec:
         contained = False
     if not contained:
         raise ServiceConfigError(f"cwd liegt ausserhalb des Workspace: {cwd!r}")
-    return ServiceSpec(name=name, command=command.strip(),
-                       ready=ReadyCheck.parse(raw.get("ready")),
-                       timeout=float(timeout), prewarm=str(prewarm), cwd=cwd)
+    return ServiceSpec(name=name, command=command.strip(), ready=ready,
+                       timeout=float(timeout), prewarm=str(prewarm), cwd=cwd,
+                       warm_routes=tuple(warm_routes))
 
 
 def _parse_rule(name: str, raw: object) -> CommandRule:
@@ -231,6 +298,16 @@ def _parse_rule(name: str, raw: object) -> CommandRule:
             or not all(isinstance(item, str) for item in requires):
         raise ServiceConfigError("requires muss eine Liste von Service-Namen sein")
     return CommandRule(name=name, match=match.strip(), requires=tuple(requires))
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):  # noqa: D102
+        return None
+
+
+# Warm-Requests folgen Redirects nicht: das Ziel bleibt immer der deklarierte
+# Service-Origin. Ein 3xx zaehlt trotzdem als aufgewaermt.
+_WARM_OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 class ServiceManager:
@@ -249,6 +326,7 @@ class ServiceManager:
         self._failures: dict[str, int] = {}
         self._announced_ready: set[str] = set()
         self._ensuring: set[str] = set()
+        self._warm_gen: dict[str, int] = {}
         self._closed = False
         self.trusted = False
         self._digest: str | None = None
@@ -529,6 +607,63 @@ class ServiceManager:
                 self._event("prewarm", f"✓ Service {name} bereit")
             return "ready"
         return "starting"
+
+    # -------------------------------------------------------- Route-Warming
+
+    def warm_after_mutation(self, changed_path: str | None = None) -> None:
+        """Waermt deklarierte Routen nach einem Edit vor.
+
+        Der GET selbst ist die Synchronisation mit dem Rebuild: Dev-Server
+        wie Next/Vite kompilieren on demand und antworten erst, wenn der
+        neue Stand steht. Es wird nie eine Antwort gecacht — reines Warming.
+        ``"auto"`` in ``warm_routes`` aktiviert die Datei→Route-Heuristik
+        fuer den editierten Pfad.
+        """
+        if self._closed or not self.refresh_trust():
+            return
+        derived = derive_routes(changed_path)
+        for name, spec in self.specs.items():
+            if not spec.warm_routes:
+                continue
+            base = spec.base_url()
+            if base is None:
+                continue
+            routes: list[str] = []
+            for item in spec.warm_routes:
+                for route in (derived if item == "auto" else [item]):
+                    if route not in routes:
+                        routes.append(route)
+            if not routes:
+                continue
+            if spec.prewarm == "manual" and not self._running(name):
+                continue  # manual heisst: nie ungefragt booten
+            with self._lock:
+                self._warm_gen[name] = self._warm_gen.get(name, 0) + 1
+                generation = self._warm_gen[name]
+            threading.Thread(target=self._warm_worker,
+                             args=(name, base, list(routes), generation),
+                             daemon=True).start()
+
+    def _warm_worker(self, name: str, base: str, routes: list[str],
+                     generation: int) -> None:
+        states = self.ensure([name])
+        if states.get(name) != "ready":
+            return
+        for route in routes:
+            with self._lock:
+                if self._warm_gen.get(name) != generation or self._closed:
+                    return  # neuere Mutation hat uebernommen
+            started = time.monotonic()
+            try:
+                with _WARM_OPENER.open(base + route, timeout=6.0) as resp:
+                    status = resp.status
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+            except Exception:  # noqa: BLE001 — Warming ist best effort
+                continue
+            self._event("prewarm",
+                        f"≈ Route {route} vorgewaermt ({name}, HTTP {status}, "
+                        f"{time.monotonic() - started:.2f}s)")
 
     # ------------------------------------------------------------- Stoppen
 
