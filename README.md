@@ -146,14 +146,17 @@ Claude Code:
 ANTHROPIC_BASE_URL=http://127.0.0.1:4242 claude
 ```
 
-Google Antigravity: open the project as usual — workspace MCP servers from
-`.agents/mcp_config.json` are discovered automatically. Run `/mcp` in the
-prompt panel once to confirm the `toolahead` server is enabled. Antigravity
-support is currently **experimental**: the CLI registers workspace MCP tools
-lazily and its agents cannot always invoke them (observed on CLI 1.1.11), and
-its print mode does not load MCP servers at all. Discovery and the full
-ToolAhead tool chain have been verified; measured speedups so far are from
-Claude Code and Codex sessions.
+Google Antigravity: open the project as usual — `init-antigravity` installs
+both the workspace MCP server (`.agents/mcp_config.json`) and lifecycle hooks
+(`.agents/hooks.json`). The hooks observe Antigravity's *native* tools
+(`run_command`, `view_file`, `replace_file_content`, …), so learning, service
+pre-warming, and route warming work even when the agent never touches the
+ToolAhead MCP tools. Run `/mcp` in the prompt panel once to confirm the
+`toolahead` server is enabled. Antigravity support is still **experimental**:
+the CLI registers workspace MCP tools lazily and its agents cannot always
+invoke them (observed on CLI 1.1.11) — which limits replay hits, not
+pre-warming — and print mode loads neither MCP servers nor project context.
+Measured speedups so far are from Claude Code and Codex sessions.
 
 See live timing and cache statistics at any time:
 

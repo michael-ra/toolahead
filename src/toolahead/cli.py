@@ -22,6 +22,10 @@ REPLAY_HELPER = ROOT / "prefetch_replay.py"
 MCP_SERVER = ROOT / "mcp.py"
 TOOL_CONTRACTS = ROOT / "tool_contracts.py"
 SERVICES = ROOT / "services.py"
+ANTIGRAVITY_HOOK = ROOT / "antigravity_hook.py"
+ANTIGRAVITY_TOOL_MATCHER = ("run_command|view_file|write_to_file|"
+                            "replace_file_content|multi_replace_file_content|"
+                            "grep_search|find_by_name")
 STATS = ROOT / "prefetch_stats.py"
 DEFAULT_URL = "http://127.0.0.1:4242"
 MCP_BEGIN = "# >>> ToolAhead managed MCP >>>"
@@ -314,21 +318,48 @@ def init_antigravity(args) -> int:
                  "--url", url],
         "env": {"TOOLAHEAD_MCP_EVENTS": "1"},
     }
+    hooks_path = project / ".agents" / "hooks.json"
+    installed_hook = runtime / "antigravity_hook.py"
+
+    def _hook_group(event: str, matcher: str) -> list:
+        command = shlex.join(["python3", str(installed_hook), event,
+                              "--url", url])
+        return [{"matcher": matcher,
+                 "hooks": [{"type": "command", "command": command,
+                            "timeout": 5}]}]
+
+    try:
+        hooks = load_object(hooks_path)
+    except (OSError, ValueError) as exc:
+        print(f"Cannot merge Antigravity hooks config: {exc}",
+              file=sys.stderr)
+        return 2
+    hooks["toolahead"] = {
+        "PreToolUse": _hook_group("PreToolUse", ANTIGRAVITY_TOOL_MATCHER),
+        "PostToolUse": _hook_group("PostToolUse", ANTIGRAVITY_TOOL_MATCHER),
+        "Stop": _hook_group("Stop", "*"),
+    }
     mcp_payload = json.dumps(mcp, indent=2, ensure_ascii=False) + "\n"
+    hooks_payload = json.dumps(hooks, indent=2, ensure_ascii=False) + "\n"
     if args.dry_run:
-        print(f"# {mcp_path}\n{mcp_payload}", end="")
+        print(f"# {mcp_path}\n{mcp_payload}# {hooks_path}\n{hooks_payload}",
+              end="")
         return 0
     _install_mcp_runtime(project)
+    shutil.copy2(ANTIGRAVITY_HOOK, installed_hook)
     mcp_path.parent.mkdir(parents=True, exist_ok=True)
     mcp_path.write_text(mcp_payload, encoding="utf-8")
+    hooks_path.write_text(hooks_payload, encoding="utf-8")
     replay = project / ".prefetch-replay.json"
     if not replay.exists():
         replay.write_text('{\n  "commands": []\n}\n', encoding="utf-8")
-    print(f"Installed Antigravity MCP: {mcp_path}")
-    print(f"MCP runtime:               {installed_mcp.parent}")
-    print(f"Replay allowlist:          {replay}")
-    print("Antigravity reads workspace servers from .agents/mcp_config.json; "
-          "run /mcp once in the prompt panel to confirm toolahead is enabled.")
+    print(f"Installed Antigravity MCP:   {mcp_path}")
+    print(f"Installed Antigravity hooks: {hooks_path}")
+    print(f"Runtime:                     {installed_mcp.parent}")
+    print(f"Replay allowlist:            {replay}")
+    print("Antigravity reads workspace servers from .agents/mcp_config.json "
+          "and hooks from .agents/hooks.json; run /mcp once in the prompt "
+          "panel to confirm toolahead is enabled.")
     return 0
 
 

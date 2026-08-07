@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0 — 2026-08-07
+
+- Added Antigravity lifecycle hooks: `init-antigravity` now also installs
+  `.agents/hooks.json` plus a fail-open adapter that reports Antigravity's
+  native tool events (`run_command`, `view_file`, `replace_file_content`, …)
+  to the daemon. Learning, mutation-triggered service pre-warming, and route
+  warming now work even when the agent uses only native tools; the ToolAhead
+  MCP tools remain necessary for replay hits.
+- The adapter always answers with a neutral `{}` decision and exit code 0 —
+  a malformed hook response could otherwise block the agent's tool calls.
+
 ## 0.4.1 — 2026-08-07
 
 - Route warming now also learns: URLs the agent actually requests after

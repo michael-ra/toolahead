@@ -35,9 +35,28 @@ class InitAntigravityTest(unittest.TestCase):
         self.assertIn("--workspace", server["args"])
         self.assertEqual(server["env"], {"TOOLAHEAD_MCP_EVENTS": "1"})
         runtime = self.project / ".toolahead" / "runtime"
-        for name in ("toolahead_mcp.py", "tool_contracts.py", "services.py"):
+        for name in ("toolahead_mcp.py", "tool_contracts.py", "services.py",
+                     "antigravity_hook.py"):
             self.assertTrue((runtime / name).exists(), name)
         self.assertTrue((self.project / ".prefetch-replay.json").exists())
+
+    def test_writes_hooks_config_and_merges(self):
+        hooks_path = self.project / ".agents" / "hooks.json"
+        hooks_path.parent.mkdir(parents=True)
+        hooks_path.write_text(json.dumps(
+            {"my-linter": {"PostToolUse": [{"matcher": "run_command",
+                                           "hooks": []}]}}),
+            encoding="utf-8")
+        self.assertEqual(init_antigravity(_args(str(self.project))), 0)
+        hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+        self.assertIn("my-linter", hooks)
+        ours = hooks["toolahead"]
+        for event in ("PreToolUse", "PostToolUse", "Stop"):
+            self.assertIn(event, ours)
+        pre = ours["PreToolUse"][0]
+        self.assertIn("replace_file_content", pre["matcher"])
+        self.assertIn("antigravity_hook.py", pre["hooks"][0]["command"])
+        self.assertIn("PreToolUse", pre["hooks"][0]["command"])
 
     def test_merges_existing_servers(self):
         path = self.project / ".agents" / "mcp_config.json"
