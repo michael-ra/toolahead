@@ -3,7 +3,7 @@
 
   <h3>Your agent's next tool call, already done.</h3>
 
-  <h3>Up to 28% faster agents.</h3>
+  <h3>28% faster agents — median of paired runs.</h3>
 
   <p><strong>Finish faster. Wait less.</strong></p>
 
@@ -42,6 +42,13 @@ ToolAhead                  └──── run predicted tool ──────
 The agent still calls ordinary MCP tools. If no matching result is ready, the
 tool runs normally. If ToolAhead prepared the exact call against the exact same
 files, the result returns immediately from memory.
+
+ToolAhead also hides a second kind of waiting: declared dev servers and other
+slow prerequisites start right after the first edit — while the model is still
+reasoning — so they are already warm and health-checked when the test or e2e
+call arrives. In a real Next.js session that turned a 3.5s dev-server wait
+into 0.45s. See
+[Pre-warming external services](#pre-warming-external-services-optional).
 
 ## See it run
 
@@ -109,6 +116,10 @@ uvx toolahead init --agent both --strict --project .
 
 # Allow this exact test command to run ahead and be reused.
 uvx toolahead allow "python3 -m pytest" --project .
+
+# Optional: declare your dev server in toolahead.toml, then approve it once
+# so it can be pre-warmed while the model reasons.
+uvx toolahead trust --project .
 
 # Start ToolAhead in the background for this workspace.
 uvx toolahead serve --workspace .
