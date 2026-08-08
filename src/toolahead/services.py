@@ -48,6 +48,7 @@ import json
 import math
 import os
 import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -258,6 +259,40 @@ def derive_routes(path: str | None, workspace: str | None = None) -> list[str]:
 
 _SHELLS = ("sh", "bash", "zsh", "dash", "ksh")
 _PREFIXES = ("time", "exec", "nohup", "command", "stdbuf", "nice")
+_PART_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "(", ")", "{", "}"})
+
+
+def command_parts(text: str) -> list[str]:
+    """Zerlegt eine Kommandozeile quoting-bewusst in die einzelnen Kommandos.
+
+    Agenten schreiben ihre Kommandos selten so, wie sie deklariert wurden:
+    ``cd web && sh e2e.sh`` ist dasselbe Kommando wie ``sh e2e.sh``. Ein
+    naiver Split wuerde dagegen Anfuehrungszeichen zerschneiden, sodass
+    ``echo "sh e2e.sh"`` faelschlich wie ein Aufruf aussieht.
+    """
+    parts: list[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            tokens = list(lexer)
+        except ValueError:
+            parts.append(line.strip())
+            continue
+        current: list[str] = []
+        for token in tokens:
+            if token in _PART_SEPARATORS:
+                if current:
+                    parts.append(shlex.join(current))
+                current = []
+            else:
+                current.append(token)
+        if current:
+            parts.append(shlex.join(current))
+    return parts
 
 
 def script_target(command: str) -> str | None:
@@ -291,15 +326,20 @@ class CommandRule:
     requires: tuple[str, ...] = field(default_factory=tuple)
 
     def matches(self, command: str) -> bool:
-        normalized = " ".join(command.strip().split())
         target = " ".join(self.match.strip().split())
         if not target:
             return False
-        if normalized == target or normalized.startswith(target + " "):
-            return True
         declared_script = script_target(target)
-        return declared_script is not None \
-            and script_target(normalized) == declared_script
+        candidates = [" ".join(command.strip().split())]
+        candidates.extend(command_parts(command))
+        for candidate in candidates:
+            normalized = " ".join(candidate.split())
+            if normalized == target or normalized.startswith(target + " "):
+                return True
+            if declared_script is not None \
+                    and script_target(normalized) == declared_script:
+                return True
+        return False
 
 
 def _parse_service(name: str, raw: object, workspace: str) -> ServiceSpec:

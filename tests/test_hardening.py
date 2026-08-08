@@ -327,9 +327,19 @@ class CommandRuleMatchTest(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertTrue(self.rule.matches(command))
 
+    def test_compound_commands_match(self):
+        """Agenten schreiben fast nie das nackte Kommando — ein vorangestelltes
+        ``cd`` darf die Readiness-Garantie nicht aushebeln."""
+        for command in ("cd /tmp/project && sh e2e.sh", "cd . && ./e2e.sh",
+                        "npm run build && sh e2e.sh", "cd web; sh e2e.sh",
+                        "bash e2e.sh 2>&1", "cd web\nsh e2e.sh"):
+            with self.subTest(command=command):
+                self.assertTrue(self.rule.matches(command))
+
     def test_unrelated_commands_do_not_match(self):
         for command in ("sh other.sh", "./other.sh", "cat e2e.sh",
-                        "npm test", "", "echo sh e2e.sh"):
+                        "npm test", "", "echo sh e2e.sh",
+                        'echo "sh e2e.sh"', "grep -r e2e.sh ."):
             with self.subTest(command=command):
                 self.assertFalse(self.rule.matches(command))
 

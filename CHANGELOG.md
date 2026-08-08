@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.2 — 2026-08-08
+
+- `[commands]` rules now match a declared command inside a compound one, so
+  `cd web && sh e2e.sh` counts as `sh e2e.sh`. Agents rarely type the bare
+  command, and without this the readiness guarantee silently did not apply.
+  Matching stays quoting-aware: `echo "sh e2e.sh"` is still not a match.
+
+Found while running three sessions each of Claude Code, Codex, and the
+Antigravity hook protocol against a real Vite + FastAPI project.
+
 ## 0.6.1 — 2026-08-08
 
 Fixes from an adversarial review of 0.6.0. Every item below was reproduced
