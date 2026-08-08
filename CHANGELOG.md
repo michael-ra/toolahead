@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.3 — 2026-08-08
+
+- An explicit `--url` in the installed hook command now wins over
+  `PREFETCH_LOOKUP_URL`. With both set they could point at different daemons,
+  so the hook reserved a result on one and the rewritten command fetched it
+  from the other.
+- Corrected a claim in the 0.2.0a2 notes about tests that were never part of
+  the published repository.
+
 ## 0.6.2 — 2026-08-08
 
 - `[commands]` rules now match a declared command inside a compound one, so
@@ -185,8 +194,10 @@ including one regression introduced by the first round:
   are actually pruned instead of being eagerly traversed.
 - Added a 20-run real Codex/Claude crossover matrix with separate task,
   contract, safety, acceleration, tool-overlap, provider, and wall metrics.
-- Added 46 integration and robustness tests covering batched chains,
-  multi-edit races, runtime hash isolation, and reservation invalidation.
+- Hardened batched chains, multi-edit races, runtime hash isolation, and
+  reservation invalidation. (The integration tests written for this release
+  were not part of the published repository; the suite that ships from 0.6.1
+  onwards covers this ground and runs in CI.)
 
 ## 0.2.0a1 — 2026-08-05
 

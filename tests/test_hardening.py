@@ -344,6 +344,42 @@ class CommandRuleMatchTest(unittest.TestCase):
                 self.assertFalse(self.rule.matches(command))
 
 
+class HookUrlPrecedenceTest(unittest.TestCase):
+    """Ein explizites --url muss die Umgebung schlagen: sonst reserviert der
+    Hook beim einen Daemon und der umgeschriebene Befehl holt das Ergebnis
+    beim anderen ab."""
+
+    def test_explicit_url_wins_over_environment(self):
+        probe = (
+            "import sys, importlib.util;"
+            "sys.argv=['hook','--url','http://127.0.0.1:2222'];"
+            f"spec=importlib.util.spec_from_file_location('h', r'{SRC}/toolahead/prefetch_hook.py');"
+            "m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m);"
+            "print(m.LOOKUP_URL, m._replay_url())"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True,
+            env=dict(os.environ,
+                     PREFETCH_LOOKUP_URL="http://127.0.0.1:1111/__prefetch/lookup"))
+        lookup, replay = out.stdout.split()
+        self.assertIn("2222", lookup)
+        self.assertIn("2222", replay)
+
+    def test_environment_still_works_without_the_flag(self):
+        probe = (
+            "import sys, importlib.util;"
+            "sys.argv=['hook'];"
+            f"spec=importlib.util.spec_from_file_location('h', r'{SRC}/toolahead/prefetch_hook.py');"
+            "m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m);"
+            "print(m.LOOKUP_URL)"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True,
+            env=dict(os.environ,
+                     PREFETCH_LOOKUP_URL="http://127.0.0.1:1111/__prefetch/lookup"))
+        self.assertIn("1111", out.stdout)
+
+
 class HookBudgetTest(unittest.TestCase):
     def test_small_budget_is_not_collapsed_to_one_second(self):
         """Ein knapp gesetztes TOOLAHEAD_ENSURE_WAIT darf nicht in ein

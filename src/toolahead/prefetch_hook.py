@@ -42,13 +42,21 @@ import sys
 # Dieser Hook laeuft VOR jedem passenden Tool-Call; sein Prozessstart liegt
 # also auf dem kritischen Pfad des Agenten. Deshalb bewusst ``http.client``
 # statt ``urllib.request``: gemessen rund 12 ms weniger Importzeit pro Aufruf.
-def _base_url() -> str:
+def _explicit_url() -> str | None:
+    """``--url`` aus dem installierten Hook-Command, falls vorhanden."""
     argv = sys.argv[1:]
     if "--url" in argv:
         try:
             return argv[argv.index("--url") + 1].rstrip("/")
         except IndexError:
             pass
+    return None
+
+
+def _base_url() -> str:
+    explicit = _explicit_url()
+    if explicit:
+        return explicit
     configured = os.environ.get("PREFETCH_LOOKUP_URL")
     if configured:
         return configured.split("/__prefetch/")[0].rstrip("/")
@@ -56,8 +64,12 @@ def _base_url() -> str:
 
 
 BASE_URL = _base_url()
-LOOKUP_URL = os.environ.get(
-    "PREFETCH_LOOKUP_URL", f"{BASE_URL}/__prefetch/lookup")
+# Das explizite Flag gewinnt gegen die Umgebung. Sonst koennten Lookup und
+# Replay auf verschiedene Daemons zeigen: der Hook reserviert dann bei dem
+# einen und der umgeschriebene Befehl holt das Ergebnis beim anderen ab.
+LOOKUP_URL = f"{BASE_URL}/__prefetch/lookup" if _explicit_url() \
+    else os.environ.get("PREFETCH_LOOKUP_URL",
+                        f"{BASE_URL}/__prefetch/lookup")
 HOOK_TIMEOUT = float(os.environ.get("PREFETCH_HOOK_TIMEOUT", "8"))
 REPLAY_TIMEOUT = float(os.environ.get("PREFETCH_REPLAY_TIMEOUT", "130"))
 REPLAY_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
