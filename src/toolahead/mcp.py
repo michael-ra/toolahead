@@ -55,7 +55,7 @@ except ImportError:  # copied project-local MCP runtime
     from services import ServiceManager
 
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 DEFAULT_URL = "http://127.0.0.1:4242"
 
 READ_DESCRIPTION = (
@@ -339,6 +339,7 @@ class ToolAheadMCP:
             "tool_input": arguments,
             "source": "toolahead-mcp",
             "cwd": self.workspace,
+            "workspace": self.workspace,
         }
         if outcome is not None:
             payload["tool_response"] = outcome.as_json()
@@ -366,6 +367,7 @@ class ToolAheadMCP:
                 "session_id": self.session_id,
                 "source": "toolahead-mcp",
                 "cwd": self.workspace,
+                "workspace": self.workspace,
             }, timeout=0.5)
         except Exception:
             pass
@@ -407,6 +409,7 @@ class ToolAheadMCP:
         payload = {
             "tool": native_name,
             "input": arguments,
+            "workspace": self.workspace,
             "wait_timeout": 0.0 if reserve else self.lookup_wait,
             "reserve": reserve,
             "meta": {
@@ -446,8 +449,14 @@ class ToolAheadMCP:
         if self.ensure_wait <= 0:
             return None
         try:
-            return self._request("/__prefetch/ensure-services",
-                                 {"command": command}, timeout=self.ensure_wait)
+            # Workspace und Budget gehoeren mit: sonst antwortet ein Daemon
+            # eines anderen Projekts, und der Server wartet laenger als der
+            # Client zuhoert (dann laeuft der Call ungeprueft los).
+            return self._request(
+                "/__prefetch/ensure-services",
+                {"command": command, "workspace": self.workspace,
+                 "wait": self.ensure_wait},
+                timeout=self.ensure_wait + 5.0)
         except Exception:  # noqa: BLE001
             return None
 

@@ -26,7 +26,8 @@ dieses Modul ein No-Op — Zero-Config-Learning bleibt der Default.
     prewarm = "mutation"    # "mutation" (Default) | "start" | "manual"
 
     [commands.e2e]
-    match = "npx playwright test"   # Praefix-Match auf das exakte Kommando
+    match = "npx playwright test"   # Praefix-Match; ein deklariertes
+                                    # .sh-Skript gilt auch als ./x.sh
     requires = ["dev-server"]
 
 Services laufen bewusst unsandboxed gegen den echten Workspace — sie SIND die
@@ -201,15 +202,40 @@ _PAGE_PATTERNS = (
 )
 
 
-def derive_routes(path: str | None) -> list[str]:
+def derive_routes(path: str | None, workspace: str | None = None) -> list[str]:
     """Leitet aus einem editierten Seiten-File die zugehoerige Route ab.
 
     Unterstuetzt Next.js (app- und pages-Router, auch unter ``src/``), Nuxt
     (``pages/*.vue``) und SvelteKit (``src/routes/**/+page.svelte``).
+
+    Der Pfad wird zuerst workspace-relativ gemacht: absolute Pfade (die Agenten
+    haeufig liefern) wuerden sonst gar keine Route ergeben, und Pfade ausserhalb
+    des Workspace duerfen ueberhaupt keine Route erzeugen — sonst waermt ein
+    ``../../app/admin/page.tsx`` eine fremde Route auf.
     """
     if not path:
         return []
-    normalized = path.replace(os.sep, "/").lstrip("./")
+    normalized = path.replace(os.sep, "/")
+    if workspace:
+        root = os.path.realpath(workspace)
+        absolute = os.path.realpath(
+            path if os.path.isabs(path) else os.path.join(root, path))
+        try:
+            if os.path.commonpath((root, absolute)) != root:
+                return []
+        except ValueError:
+            return []
+        normalized = os.path.relpath(absolute, root).replace(os.sep, "/")
+    elif os.path.isabs(normalized):
+        return []
+    # Ohne Workspace-Kontext ist ein herausfuehrender Pfad nicht aufloesbar:
+    # konservativ keine Route statt einer erfundenen. Die Pruefung muss VOR
+    # dem Strippen stehen — sonst entfernt es genau die ".."-Marker.
+    if normalized.startswith("../") or "/../" in normalized \
+            or normalized == "..":
+        return []
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
     for pattern in _PAGE_PATTERNS:
         match = pattern.match(normalized)
         if match is None:
@@ -230,6 +256,34 @@ def derive_routes(path: str | None) -> list[str]:
     return []
 
 
+_SHELLS = ("sh", "bash", "zsh", "dash", "ksh")
+_PREFIXES = ("time", "exec", "nohup", "command", "stdbuf", "nice")
+
+
+def script_target(command: str) -> str | None:
+    """Das von diesem Kommando ausgefuehrte Skript, normalisiert.
+
+    ``sh e2e.sh``, ``bash ./e2e.sh`` und ``./e2e.sh`` benennen dieselbe Datei.
+    Wer ``requires`` fuer ein Skript deklariert, meint es unabhaengig davon,
+    wie der Agent es gerade aufruft — sonst faellt die Readiness-Garantie
+    stillschweigend weg, sobald das Modell eine andere Schreibweise waehlt.
+    """
+    words = command.strip().split()
+    while words and (words[0] in _PREFIXES
+                     or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0])):
+        words.pop(0)
+    if not words:
+        return None
+    head = os.path.basename(words[0])
+    if head in _SHELLS:
+        target = next((w for w in words[1:] if not w.startswith("-")), None)
+    else:
+        target = words[0]
+    if not target or not target.endswith(".sh"):
+        return None
+    return os.path.normpath(target).lstrip("./") or None
+
+
 @dataclass(frozen=True)
 class CommandRule:
     name: str
@@ -241,7 +295,11 @@ class CommandRule:
         target = " ".join(self.match.strip().split())
         if not target:
             return False
-        return normalized == target or normalized.startswith(target + " ")
+        if normalized == target or normalized.startswith(target + " "):
+            return True
+        declared_script = script_target(target)
+        return declared_script is not None \
+            and script_target(normalized) == declared_script
 
 
 def _parse_service(name: str, raw: object, workspace: str) -> ServiceSpec:
@@ -327,6 +385,10 @@ class ServiceManager:
         self._announced_ready: set[str] = set()
         self._ensuring: set[str] = set()
         self._warm_gen: dict[str, int] = {}
+        # Pro Service serialisiert: ein laufender Warm-GET kann nicht
+        # abgebrochen werden, also darf gar nicht erst ein zweiter parallel
+        # laufen — sonst ueberholen sich Requests und Seiteneffekte doppeln.
+        self._warm_locks: dict[str, threading.Lock] = {}
         self._closed = False
         self.trusted = False
         self._digest: str | None = None
@@ -623,17 +685,23 @@ class ServiceManager:
         """
         if self._closed or not self.refresh_trust():
             return
-        derived = derive_routes(changed_path)
-        for route in (learned_routes or []):
-            if isinstance(route, str) and route.startswith("/") \
-                    and route not in derived:
-                derived.append(route)
         for name, spec in self.specs.items():
             if not spec.warm_routes:
                 continue
             base = spec.base_url()
             if base is None:
                 continue
+            # Routen liegen im Wurzelverzeichnis DES SERVICE, nicht des
+            # Repos: in einem Monorepo mit ``cwd = "web"`` ergibt
+            # ``web/app/dashboard/page.tsx`` die Route ``/dashboard``.
+            root = os.path.join(self.workspace, spec.cwd)
+            derived = derive_routes(changed_path, root)
+            if not derived and spec.cwd not in (".", ""):
+                derived = derive_routes(changed_path, self.workspace)
+            for route in (learned_routes or []):
+                if isinstance(route, str) and route.startswith("/") \
+                        and route not in derived:
+                    derived.append(route)
             routes: list[str] = []
             for item in spec.warm_routes:
                 for route in (derived if item == "auto" else [item]):
@@ -646,30 +714,36 @@ class ServiceManager:
             with self._lock:
                 self._warm_gen[name] = self._warm_gen.get(name, 0) + 1
                 generation = self._warm_gen[name]
+                lock = self._warm_locks.setdefault(name, threading.Lock())
             threading.Thread(target=self._warm_worker,
-                             args=(name, base, list(routes), generation),
+                             args=(name, base, list(routes), generation, lock),
                              daemon=True).start()
 
     def _warm_worker(self, name: str, base: str, routes: list[str],
-                     generation: int) -> None:
+                     generation: int, lock: threading.Lock) -> None:
         states = self.ensure([name])
         if states.get(name) != "ready":
             return
-        for route in routes:
-            with self._lock:
-                if self._warm_gen.get(name) != generation or self._closed:
-                    return  # neuere Mutation hat uebernommen
-            started = time.monotonic()
-            try:
-                with _WARM_OPENER.open(base + route, timeout=6.0) as resp:
-                    status = resp.status
-            except urllib.error.HTTPError as exc:
-                status = exc.code
-            except Exception:  # noqa: BLE001 — Warming ist best effort
-                continue
-            self._event("prewarm",
-                        f"≈ Route {route} vorgewaermt ({name}, HTTP {status}, "
-                        f"{time.monotonic() - started:.2f}s)")
+        # Ein bereits laufender Warm-Request laesst sich nicht abbrechen.
+        # Deshalb wartet die neuere Generation, bis die aeltere fertig ist,
+        # und verwirft sich danach selbst, falls inzwischen eine noch neuere
+        # Mutation kam. So ueberlappen Warm-GETs nie.
+        with lock:
+            for route in routes:
+                with self._lock:
+                    if self._warm_gen.get(name) != generation or self._closed:
+                        return  # neuere Mutation hat uebernommen
+                started = time.monotonic()
+                try:
+                    with _WARM_OPENER.open(base + route, timeout=6.0) as resp:
+                        status = resp.status
+                except urllib.error.HTTPError as exc:
+                    status = exc.code
+                except Exception:  # noqa: BLE001 — Warming ist best effort
+                    continue
+                self._event("prewarm",
+                            f"≈ Route {route} vorgewaermt ({name}, HTTP "
+                            f"{status}, {time.monotonic() - started:.2f}s)")
 
     # ------------------------------------------------------------- Stoppen
 

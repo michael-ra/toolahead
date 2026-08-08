@@ -19,7 +19,22 @@ import urllib.parse
 import urllib.request
 
 
-BASE_URL = os.environ.get("TOOLAHEAD_URL", "http://127.0.0.1:4242").rstrip("/")
+def _configured_base() -> str:
+    """Daemon-Basis: ``--url`` aus dem Hook-Command schlaegt die Umgebung.
+
+    Ohne das landet jedes Projekt auf dem Default-Port und ein zweiter,
+    fremder Daemon wuerde ueber die Kommandos dieses Workspace entscheiden.
+    """
+    argv = sys.argv[1:]
+    if "--url" in argv:
+        try:
+            return argv[argv.index("--url") + 1].rstrip("/")
+        except IndexError:
+            pass
+    return os.environ.get("TOOLAHEAD_URL", "http://127.0.0.1:4242").rstrip("/")
+
+
+BASE_URL = _configured_base()
 LOOKUP_URL = os.environ.get(
     "PREFETCH_LOOKUP_URL", f"{BASE_URL}/__prefetch/lookup")
 EVENT_URL = os.environ.get(
@@ -43,13 +58,18 @@ def _ensure_deny_reason(command: str, cwd: str) -> str:
     untrusted, kein deklariertes Kommando → leerer String (Call laeuft
     normal). ``TOOLAHEAD_ENSURE_WAIT=0`` schaltet das Warten komplett ab."""
     try:
-        wait = float(os.environ.get("TOOLAHEAD_ENSURE_WAIT", "45"))
+        wait = float(os.environ.get("TOOLAHEAD_ENSURE_WAIT", "110"))
     except ValueError:
-        wait = 45.0
+        wait = 110.0
     if wait <= 0 or not os.path.exists(os.path.join(cwd, "toolahead.toml")):
         return ""
     try:
-        result = _post(ENSURE_URL, {"command": command}, timeout=wait)
+        # Workspace mitgeben: sonst entscheidet der Daemon eines fremden
+        # Projekts (gleicher Default-Port) ueber dieses Kommando.
+        result = _post(ENSURE_URL,
+                       {"command": command,
+                        "workspace": os.path.realpath(cwd),
+                        "wait": wait}, timeout=wait + 5.0)
     except Exception:  # noqa: BLE001
         return ""
     if not isinstance(result, dict) or not result.get("ok"):
@@ -194,6 +214,8 @@ def main() -> int:
     # A cancelled command may never reach PostToolUse. SessionEnd is the final
     # safe point to remove every abandoned output-bearing ticket immediately.
     _cleanup_tickets(remove_all=event_name == "SessionEnd")
+    event.setdefault("workspace",
+                     os.path.realpath(event.get("cwd") or os.getcwd()))
     try:
         _post(EVENT_URL, event)
     except Exception:
@@ -232,6 +254,8 @@ def main() -> int:
             "tool": "Bash",
             "input": tool_input,
             "reserve": True,
+            "workspace": os.path.realpath(
+                event.get("cwd") or os.getcwd()),
             "meta": _meta(event),
         })
     except Exception:

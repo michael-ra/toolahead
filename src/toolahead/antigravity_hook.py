@@ -7,10 +7,18 @@ Antigravity-Tool-Events in ToolAheads provider-neutrales Event-Format und
 meldet sie fail-open an den lokalen Daemon.
 
 KRITISCH: Ein Hook, der ungueltigen Output liefert, kann in Antigravity
-Tool-Calls blockieren. Dieser Adapter druckt deshalb IMMER ``{}`` (keine
-Decision, keine Einmischung in Permissions) und endet mit Exit-Code 0 —
-unabhaengig davon, was intern passiert. Der Event-Name kommt als argv[1],
-weil Antigravity ihn nicht im Payload mitschickt.
+Tool-Calls blockieren. Der Adapter druckt deshalb IMMER eine fuer das jeweilige
+Event gueltige, neutrale Antwort und endet mit Exit-Code 0 — unabhaengig davon,
+was intern passiert.
+
+Neutral heisst dabei je Event etwas anderes: PreToolUse VERLANGT ein
+``decision``-Feld, dort ist ``{"decision": "allow"}`` das Nichts-tun. Fuer
+PostToolUse und Stop ist ``{}`` neutral (bei Stop bedeutet das: normale
+Beendigung zulassen). Ein leeres Objekt bei PreToolUse waere schema-ungueltig
+und koennte den eigentlichen Tool-Call blockieren.
+
+Der Event-Name kommt als argv[1], weil Antigravity ihn nicht im Payload
+mitschickt.
 """
 
 from __future__ import annotations
@@ -98,18 +106,20 @@ def ensure_deny_reason(command: str, workspace: str, url: str) -> str:
     untrusted, kein deklariertes Kommando → leerer String (Call laeuft
     normal). ``TOOLAHEAD_ENSURE_WAIT=0`` schaltet das Warten komplett ab."""
     try:
-        wait = float(os.environ.get("TOOLAHEAD_ENSURE_WAIT", "45"))
+        wait = float(os.environ.get("TOOLAHEAD_ENSURE_WAIT", "110"))
     except ValueError:
-        wait = 45.0
+        wait = 110.0
     if wait <= 0 or not workspace \
             or not os.path.exists(os.path.join(workspace, "toolahead.toml")):
         return ""
     try:
         request = urllib.request.Request(
             url.rstrip("/") + "/__prefetch/ensure-services", method="POST",
-            data=json.dumps({"command": command}).encode(),
+            data=json.dumps({"command": command,
+                             "workspace": os.path.realpath(workspace),
+                             "wait": wait}).encode(),
             headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=wait) as response:
+        with urllib.request.urlopen(request, timeout=wait + 5.0) as response:
             result = json.loads(response.read())
     except Exception:  # noqa: BLE001
         return ""
@@ -126,6 +136,33 @@ def ensure_deny_reason(command: str, workspace: str, url: str) -> str:
     return ""
 
 
+def neutral_response(event_name: str) -> str:
+    """Die schema-gueltige "misch dich nicht ein"-Antwort je Event."""
+    if event_name == "PreToolUse":
+        # PreToolUse verlangt ein decision-Feld; {} wuerde den Call blockieren.
+        return json.dumps({"decision": "allow"})
+    # PostToolUse/Stop: kein decision → Standardverhalten (bei Stop: beenden).
+    return "{}"
+
+
+def _workspace_for(payload: dict, tool_call: object) -> str:
+    """Arbeitsverzeichnis des Calls; faellt auf den Workspace-Root zurueck.
+
+    ``Cwd`` des konkreten ``run_command`` ist genauer als der erste
+    Workspace-Pfad — bei mehreren Roots oder verschachtelten Projekten
+    entscheidet sonst das falsche Verzeichnis ueber die Service-Regeln.
+    """
+    if isinstance(tool_call, dict):
+        args = tool_call.get("args")
+        if isinstance(args, dict):
+            for key in ("Cwd", "cwd", "WorkingDirectory"):
+                value = args.get(key)
+                if isinstance(value, str) and os.path.isdir(value):
+                    return value
+    paths = payload.get("workspacePaths") or []
+    return paths[0] if paths and isinstance(paths[0], str) else ""
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     event_name = argv[0] if argv else "PostToolUse"
@@ -135,13 +172,16 @@ def main(argv: list[str] | None = None) -> int:
             url = argv[argv.index("--url") + 1]
         except IndexError:
             pass
-    output = "{}"
+    output = neutral_response(event_name)
     try:
         payload = json.load(sys.stdin)
         if not isinstance(payload, dict):
             raise ValueError
         event = build_event(event_name, payload)
         if event is not None:
+            workspace = _workspace_for(payload, payload.get("toolCall"))
+            if workspace:
+                event["workspace"] = os.path.realpath(workspace)
             request = urllib.request.Request(
                 url.rstrip("/") + "/__prefetch/agent-event", method="POST",
                 data=json.dumps(event, separators=(",", ":")).encode(),
@@ -149,14 +189,13 @@ def main(argv: list[str] | None = None) -> int:
             urllib.request.urlopen(request, timeout=0.8).read()
         if event is not None and event_name == "PreToolUse" \
                 and event.get("tool_name") == "Bash":
-            paths = payload.get("workspacePaths") or []
-            workspace = paths[0] if paths and isinstance(paths[0], str) else ""
+            workspace = _workspace_for(payload, payload.get("toolCall"))
             reason = ensure_deny_reason(
                 event["tool_input"].get("command", ""), workspace, url)
             if reason:
                 output = json.dumps({"decision": "deny", "reason": reason})
     except Exception:  # noqa: BLE001 — Hooks duerfen NIE blockieren
-        output = "{}"
+        output = neutral_response(event_name)
     # Immer eine gueltige Antwort — sonst kann Antigravity den eigentlichen
     # Tool-Call verweigern.
     sys.stdout.write(output + "\n")

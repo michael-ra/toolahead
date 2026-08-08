@@ -332,6 +332,10 @@ class PrefetchEngine:
         self.mutation_generation = 0
         self.last_mutation_wall: float | None = None
         self._recent_edit_paths: list[str] = []
+        # Gelernte Datei→Route-Zuordnungen. Bewusst NUR im Speicher: eine
+        # persistierte Datei im Repo waere ein Steuerkanal fuer automatische
+        # GETs, den das Trust-Gate (nur toolahead.toml) nicht abdeckt.
+        self.route_memory: dict[str, dict[str, float]] = {}
         self.pending_restarts: dict[str, dict] = {}
         self.mutation_timers: dict[str, dict] = {}
         self.mutation_debounce_s = max(
@@ -790,7 +794,11 @@ class PrefetchEngine:
             self.record_transition(previous, cur, tool, args)
             mutation_generation = None
             mutation_failed = tool == "edit" and not self._mutation_succeeded(event)
-            if tool == "bash":
+            if tool == "bash" and self._mutation_succeeded(event):
+                # Nur ein erfolgreicher Aufruf beweist, dass diese URL wirklich
+                # bedient wurde. Ein fehlgeschlagenes curl (Server aus, 404,
+                # Tippfehler) waere sonst die billigste Art, eine Route
+                # unterzuschieben.
                 self._learn_routes(args.get("command", ""))
             if tool == "edit" and not mutation_failed:
                 edited = _path_key(args.get("path", ""), self.workspace)
@@ -853,42 +861,146 @@ class PrefetchEngine:
     # -- Gelernte Datei→Route-Transitionen (Stufe 2 des Route-Warmings) --
     #
     # Beobachtet, welche URLs der Agent nach Edits bestimmter Dateien wirklich
-    # anfragt (aus Bash-Kommandos und referenzierten Shell-Skripten), und
-    # merkt sie in der Transition-Table unter einem eigenen Key-Namespace
-    # (``editfile:<pfad>`` → ``route:<pfad>``), der nie mit Tool-Chain-Keys
-    # kollidiert. Gelernt wird nur fuer Origins deklarierter Services.
+    # ABRUFT, und merkt sich das fuer kuenftiges Route-Warming.
+    #
+    # Zwei Eigenschaften sind hier Sicherheitsanforderungen, keine Details:
+    #
+    #   1. Gelernt wird nur aus Kommandos, die die URL tatsaechlich abrufen
+    #      (HTTP-Clients). Eine blosse Erwaehnung — ``echo http://…/logout``,
+    #      ein Kommentar, eine Log-Zeile — darf nie zu einem spaeteren GET
+    #      werden, denn der Agent hat diese URL nie aufgerufen.
+    #   2. Der Speicher ist ausschliesslich In-Memory und wird nie persistiert.
+    #      Sonst koennte ein geklontes Repository eine vorbereitete
+    #      ``.prefetch-table.json`` mitliefern und damit steuern, welche URLs
+    #      ToolAhead spaeter automatisch abruft — am Trust-Gate vorbei, das
+    #      nur ``toolahead.toml`` abdeckt.
 
     _URL_RE = re.compile(r"https?://[^\s\"'`)>]+")
+    # Kommandos, die eine URL wirklich abrufen. Bewusst konservativ: was hier
+    # fehlt, fuehrt nur dazu, dass eine Route nicht gelernt wird.
+    _FETCH_EXECUTABLES = frozenset({
+        "curl", "wget", "http", "https", "xh", "xhs", "httpie", "hurl",
+        "wrk", "ab", "siege", "k6", "lighthouse", "vegeta", "hey",
+    })
+    _SCRIPT_RUNNERS = frozenset({"sh", "bash", "zsh", "dash", "ksh",
+                                 "source", "."})
+    # Praefixe, die vor dem eigentlichen Kommando stehen duerfen.
+    _WRAPPERS = frozenset({"time", "exec", "nohup", "command", "builtin",
+                           "stdbuf", "nice"})
+    _SEPARATORS = frozenset({";", "&&", "||", "|", "&", "(", ")", "{", "}"})
 
     def _service_origins(self) -> set[str]:
         return {spec.base_url() for spec in self.services.specs.values()
                 if spec.base_url() is not None}
 
-    def _urls_in_command(self, command: str) -> list[str]:
-        texts = [command]
-        for word in _shell_words(command):
-            if word.endswith(".sh"):
-                path = word if os.path.isabs(word) \
-                    else os.path.join(self.workspace, word)
-                real = os.path.realpath(path)
-                ws = os.path.realpath(self.workspace)
-                try:
-                    inside = os.path.commonpath((ws, real)) == ws
-                except ValueError:
-                    inside = False
-                if inside and os.path.isfile(real) \
-                        and os.path.getsize(real) <= 65536:
-                    try:
-                        with open(real, encoding="utf-8",
-                                  errors="replace") as fh:
-                            texts.append(fh.read())
-                    except OSError:
-                        pass
+    @classmethod
+    def _command_parts(cls, text: str) -> list[list[str]]:
+        """Zerlegt eine Kommandozeile quoting-bewusst in einzelne Kommandos.
+
+        Wichtig fuer die Korrektheit: ein naiver Split auf ``;&|`` zerschneidet
+        Anfuehrungszeichen, wodurch beliebiger Text (etwa ein ``curl`` in einem
+        String) zum vermeintlichen Kommandonamen wird. Laesst sich eine Zeile
+        nicht sauber zerlegen, wird sie verworfen statt geraten.
+        """
+        parts: list[list[str]] = []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+                lexer.whitespace_split = True
+                lexer.commenters = "#"
+                tokens = list(lexer)
+            except ValueError:
+                continue  # unbalancierte Quotes: nichts lernen
+            current: list[str] = []
+            for token in tokens:
+                if token in cls._SEPARATORS:
+                    if current:
+                        parts.append(current)
+                    current = []
+                else:
+                    current.append(token)
+            if current:
+                parts.append(current)
+        return parts
+
+    @classmethod
+    def _head(cls, words: list[str]) -> tuple[str | None, list[str]]:
+        """Erstes echtes Kommandowort ohne Env-Zuweisungen und Wrapper."""
+        rest = list(words)
+        while rest:
+            word = rest[0]
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", word) \
+                    or os.path.basename(word).lower() in cls._WRAPPERS:
+                rest.pop(0)
+                continue
+            return word, rest[1:]
+        return None, []
+
+    @classmethod
+    def _fetches(cls, words: list[str]) -> bool:
+        """Ruft dieses Kommando eine URL ab (statt sie nur zu erwaehnen)?"""
+        head, _rest = cls._head(words)
+        return head is not None \
+            and os.path.basename(head).lower() in cls._FETCH_EXECUTABLES
+
+    def _script_path(self, words: list[str]) -> str | None:
+        """Vom Kommando wirklich AUSGEFUEHRTES Shell-Skript im Workspace.
+
+        ``sh e2e.sh``, ``./e2e.sh`` und ``. ./e2e.sh`` zaehlen; ``cat e2e.sh``
+        nicht — sonst wuerde blosses Anschauen einer Datei ihre URLs lernen.
+        """
+        head, rest = self._head(words)
+        if head is None:
+            return None
+        if os.path.basename(head).lower() in self._SCRIPT_RUNNERS:
+            target = next((word for word in rest
+                           if not word.startswith("-")), None)
+        elif head.endswith(".sh"):
+            target = head
+        else:
+            return None
+        if not target or not target.endswith(".sh"):
+            return None
+        real = os.path.realpath(
+            target if os.path.isabs(target)
+            else os.path.join(self.workspace, target))
+        root = os.path.realpath(self.workspace)
+        try:
+            if os.path.commonpath((root, real)) != root:
+                return None
+        except ValueError:
+            return None
+        if not os.path.isfile(real) or os.path.getsize(real) > 65536:
+            return None
+        return real
+
+    def _fetched_urls(self, command: str) -> list[str]:
+        """URLs, die dieses Kommando nachweislich abruft."""
         found: list[str] = []
-        for text in texts:
-            for url in self._URL_RE.findall(text):
-                if url not in found:
-                    found.append(url)
+
+        def collect(parts: list[list[str]]) -> list[str]:
+            scripts: list[str] = []
+            for words in parts:
+                if self._fetches(words):
+                    for word in words:
+                        for url in self._URL_RE.findall(word):
+                            if url not in found:
+                                found.append(url)
+                script = self._script_path(words)
+                if script is not None and script not in scripts:
+                    scripts.append(script)
+            return scripts
+
+        for script in collect(self._command_parts(command)):
+            try:
+                with open(script, encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
+            except OSError:
+                continue
+            # Nur eine Ebene tief: verschachtelte Skripte werden nicht verfolgt.
+            collect(self._command_parts(content))
         return found
 
     def _learn_routes(self, command: str) -> None:
@@ -900,15 +1012,16 @@ class PrefetchEngine:
         if not edits:
             return
         recorded = False
-        for url in self._urls_in_command(command):
+        for url in self._fetched_urls(command):
             parts = urlparse(url)
             origin = f"{parts.scheme}://{parts.netloc}"
             if origin not in origins:
                 continue
             route = parts.path or "/"
             for path in edits:
-                with self.table_lock:
-                    self.table.record(f"editfile:{path}", f"route:{route}")
+                with self.lock:
+                    bucket = self.route_memory.setdefault(path, {})
+                    bucket[route] = bucket.get(route, 0) + 1
                 recorded = True
                 self._event("prewarm", f"🧭 gelernt: {path} → {route}")
         if recorded:
@@ -919,12 +1032,10 @@ class PrefetchEngine:
     def learned_routes_for(self, changed_path: str | None) -> list[str]:
         if not changed_path:
             return []
-        key = f"editfile:{_path_key(changed_path, self.workspace)}"
-        with self.table_lock:
-            candidates = [(nxt[len("route:"):], count)
-                          for (prev, nxt), count in self.table.counts.items()
-                          if prev == key and nxt.startswith("route:")]
-        candidates.sort(key=lambda item: -item[1])
+        key = _path_key(changed_path, self.workspace)
+        with self.lock:
+            candidates = sorted(self.route_memory.get(key, {}).items(),
+                                key=lambda item: -item[1])
         return [route for route, _count in candidates[:3]]
 
     def _divert_external(self, tool: str, args: dict, reason: str) -> bool:
@@ -1879,6 +1990,27 @@ def _write_chunk(wfile, data: bytes):
     wfile.flush()
 
 
+def _foreign_workspace(engine: PrefetchEngine, payload: dict) -> bool:
+    """Stammt diese Anfrage aus einem anderen Workspace als dem des Daemons?
+
+    Mehrere Projekte teilen sich schnell den Default-Port. Ohne diese Pruefung
+    entscheidet der Daemon von Projekt A ueber Kommandos aus Projekt B, startet
+    dessen Services und liefert dessen Dateiinhalte aus. Ohne Angabe bleibt es
+    beim alten Verhalten (fail-open), damit aeltere Hooks weiter funktionieren.
+    """
+    claimed = payload.get("workspace") if isinstance(payload, dict) else None
+    if not isinstance(claimed, str) or not claimed:
+        return False
+    try:
+        root = os.path.realpath(engine.workspace)
+        real = os.path.realpath(claimed)
+        # Ein Unterverzeichnis des Projekts ist dasselbe Projekt: Agenten
+        # melden oft das aktuelle Arbeitsverzeichnis, nicht den Repo-Root.
+        return os.path.commonpath((root, real)) != root
+    except (OSError, ValueError):
+        return True
+
+
 def make_handler(proxy: Proxy, engine: PrefetchEngine):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -1922,6 +2054,13 @@ def make_handler(proxy: Proxy, engine: PrefetchEngine):
             if path == "/__prefetch/lookup":
                 try:
                     q = json.loads(body)
+                    # Ein Treffer liefert Dateiinhalte und Kommando-Ausgaben
+                    # aus DIESEM Workspace aus. Ein Aufrufer aus einem anderen
+                    # Projekt darf sie nicht bekommen.
+                    if _foreign_workspace(engine, q):
+                        self._json(200, {"hit": False,
+                                         "reason": "workspace mismatch"})
+                        return
                     tool, args = cc_toolcall(q.get("tool"), q.get("input", {}))
                     meta = q.get("meta") if isinstance(q.get("meta"), dict) else {
                         key: q.get(key) for key in
@@ -1940,11 +2079,34 @@ def make_handler(proxy: Proxy, engine: PrefetchEngine):
                 # Service-Timeouts). Ohne Deklaration antwortet das sofort.
                 try:
                     q = json.loads(body or b"{}")
+                    # Ein Hook darf nie den Daemon eines FREMDEN Workspace
+                    # befragen: dessen Regeln wuerden ueber dieses Kommando
+                    # entscheiden (falsche Freigabe oder falscher Service).
+                    # Ohne Angabe bleibt es beim alten Verhalten.
+                    if _foreign_workspace(engine, q):
+                        self._json(200, {
+                            "ok": False, "reason": "workspace mismatch",
+                            "daemon_workspace": engine.workspace})
+                        return
                     names = q.get("services")
                     if isinstance(q.get("command"), str):
                         names = engine.services.requirements_for(q["command"])
                     names = [n for n in (names or []) if isinstance(n, str)]
-                    result = engine.services.ensure(names, report=True) \
+                    # Der Client sagt, wie lange er ueberhaupt warten kann.
+                    # Laenger zu warten hiesse, dass sein Timeout zuschlaegt
+                    # und der Call ohne Antwort — also ungeprueft — losliefe.
+                    budget = q.get("wait")
+                    try:
+                        budget = float(budget) if budget is not None else None
+                    except (TypeError, ValueError):
+                        budget = None
+                    if names and budget is not None and budget > 0:
+                        declared = max(engine.services.specs[name].timeout
+                                       for name in names
+                                       if name in engine.services.specs)
+                        budget = min(budget, declared)
+                    result = engine.services.ensure(
+                        names, wait=budget, report=True) \
                         if names else {"states": {}, "started_now": []}
                     states = result["states"]
                     with engine.lock:
@@ -1967,6 +2129,13 @@ def make_handler(proxy: Proxy, engine: PrefetchEngine):
                     event = json.loads(body)
                     if not isinstance(event, dict):
                         raise ValueError("event must be an object")
+                    # Dieser Endpunkt startet Services, treibt Spekulation und
+                    # lernt Routen — er braucht dieselbe Workspace-Pruefung wie
+                    # ensure-services, nicht weniger.
+                    if _foreign_workspace(engine, event):
+                        self._json(200, {"ok": False,
+                                         "reason": "workspace mismatch"})
+                        return
                     self._json(200, engine.handle_agent_event(event))
                 except Exception as e:  # noqa: BLE001
                     self._json(200, {"ok": False, "error": str(e)})
@@ -2023,12 +2192,29 @@ def make_handler(proxy: Proxy, engine: PrefetchEngine):
     return Handler
 
 
+def default_table_path(workspace: str) -> str:
+    """Ablageort der gelernten Transition-Table — bewusst AUSSERHALB des Repos.
+
+    Die Tabelle steuert, was ToolAhead spekulativ ausfuehrt. Laege sie im
+    Projekt, koennte ein geklontes Repository eine vorbereitete Datei
+    mitliefern und damit Kommandos in der Wegwerfkopie starten lassen, bevor
+    der Nutzer irgendetwas freigegeben hat. Der Pfad wird aus dem echten
+    Workspace-Pfad abgeleitet, damit Projekte sich nicht vermischen.
+    """
+    root = os.path.realpath(workspace)
+    digest = hashlib.sha256(root.encode()).hexdigest()[:16]
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(root))[:40] or "ws"
+    return os.path.join(os.path.expanduser("~"), ".toolahead", "tables",
+                        f"{name}-{digest}.json")
+
+
 def build(port=None, upstream=None, workspace=None, table=None):
     port = int(os.environ.get("PREFETCH_PORT", "4242")) if port is None else port
     upstream = upstream or os.environ.get("UPSTREAM_URL", "https://api.anthropic.com")
     workspace = workspace or os.environ.get("PREFETCH_WORKSPACE", os.getcwd())
-    table = table or os.environ.get("PREFETCH_TABLE",
-                                    os.path.join(workspace, ".prefetch-table.json"))
+    table = table or os.environ.get("PREFETCH_TABLE") \
+        or default_table_path(workspace)
+    os.makedirs(os.path.dirname(table) or ".", exist_ok=True)
     engine = PrefetchEngine(workspace, table)
     proxy = Proxy(upstream, engine)
     httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(proxy, engine))

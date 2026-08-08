@@ -55,23 +55,37 @@ class BuildEventTest(unittest.TestCase):
 
 class FailOpenOutputTest(unittest.TestCase):
     """Ein kaputter Hook kann in Antigravity Tool-Calls blockieren — der
-    Adapter muss deshalb bei JEDEM Input valides ``{}`` liefern."""
+    Adapter muss deshalb bei JEDEM Input eine schema-gueltige neutrale
+    Antwort liefern. Fuer PreToolUse ist das ``{"decision": "allow"}``:
+    dort verlangt der Hook-Contract ein ``decision``-Feld, ein leeres Objekt
+    waere ungueltig und koennte den Tool-Call verweigern lassen."""
 
-    def _run(self, stdin: bytes) -> str:
+    def _run(self, stdin: bytes, event: str = "PreToolUse") -> str:
         result = subprocess.run(
-            [sys.executable, str(HOOK), "PreToolUse",
+            [sys.executable, str(HOOK), event,
              "--url", "http://127.0.0.1:9"],  # Port 9: garantiert kein Daemon
             input=stdin, capture_output=True, timeout=15)
         self.assertEqual(result.returncode, 0)
         return result.stdout.decode().strip()
 
     def test_garbage_input(self):
-        self.assertEqual(self._run(b"not json at all"), "{}")
+        self.assertEqual(json.loads(self._run(b"not json at all")),
+                         {"decision": "allow"})
 
     def test_valid_input_daemon_down(self):
         payload = json.dumps({"toolCall": {"name": "run_command",
                                            "args": {"CommandLine": "ls"}}})
-        self.assertEqual(self._run(payload.encode()), "{}")
+        self.assertEqual(json.loads(self._run(payload.encode())),
+                         {"decision": "allow"})
+
+    def test_post_tool_use_stays_empty(self):
+        payload = json.dumps({"toolCall": {"name": "view_file",
+                                           "args": {"TargetFile": "a.py"}}})
+        self.assertEqual(self._run(payload.encode(), "PostToolUse"), "{}")
+
+    def test_stop_allows_termination(self):
+        # Nur ``decision: continue`` wuerde den Agenten weiterlaufen lassen.
+        self.assertEqual(self._run(json.dumps({}).encode(), "Stop"), "{}")
 
 
 class EnsureDenyTest(unittest.TestCase):

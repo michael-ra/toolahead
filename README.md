@@ -208,7 +208,9 @@ keeps one set:
   Descriptions are intentionally short to reduce the tokens sent to the model.
 
 Omit `--strict` if you want to keep all native file tools visible while trying
-ToolAhead.
+ToolAhead. Switching back is safe: every `toolahead init` writes the routing
+that its flags describe, so a later run without `--strict` restores the native
+file tools and removes the strict marker along with the MCP registration.
 
 ## Predictions can be wrong. Returned results cannot.
 
@@ -329,7 +331,8 @@ prewarm = "mutation"     # "mutation" (default) | "start" | "manual"
 warm_routes = ["/", "auto"]  # optional: pre-request routes after every edit
 
 [commands.e2e]
-match = "npx playwright test"   # prefix match on the exact command
+match = "npx playwright test"   # prefix match; a declared .sh script
+                                # also matches ./script.sh and bash script.sh
 requires = ["dev-server"]
 ```
 
@@ -375,12 +378,17 @@ With a trusted config:
   entry derives the route from the edited file for Next.js (app and pages
   router), Nuxt, and SvelteKit — editing `app/dashboard/page.tsx` warms
   `/dashboard`. On top of the heuristic, ToolAhead learns which URLs your
-  agent actually requests after editing a file (from its commands and the
-  shell scripts they reference, for declared service origins only) and warms
-  those on the next edit too. Warm requests are GET-only against the declared
-  service
-  origin, never follow redirects elsewhere, are never cached, and a newer
-  edit supersedes an in-flight warm round.
+  agent actually *fetches* after editing a file and warms those on the next
+  edit too. Learning requires a real fetch — an HTTP client such as `curl` or
+  `wget`, either directly or inside a shell script the command executed. A URL
+  that merely appears in output, a comment, or a file the agent only read is
+  never learned, so it can never become an unexpected request later. What is
+  learned lives in memory for the session only and is never written to disk:
+  a cloned repository cannot ship a file that steers these requests.
+  Warm requests are GET-only against the declared service origin, never follow
+  redirects elsewhere, are never cached, and never overlap — a newer edit waits
+  for the in-flight round and then supersedes it.
+  `toolahead trust` prints the exact auto-GET targets before you approve them.
 - Readiness means *reachable*, not "has processed your latest edit": a
   hot-reload server that was already running may briefly still serve the
   previous build. ToolAhead never adds a wait for this — instead, when a run
@@ -394,10 +402,12 @@ With a trusted config:
   rendered output is not a pure function of the files.
 
 Everything here is strictly opt-in: without `toolahead.toml` nothing starts and
-nothing changes. `TOOLAHEAD_ENSURE_WAIT=0` disables the bounded wait before
-real commands entirely. Service output is logged to
-`.toolahead/services/<name>.log`, and `toolahead status` shows each service's
-state.
+nothing changes. `TOOLAHEAD_ENSURE_WAIT` caps how long a hook waits for
+readiness (110 seconds by default, below the 120-second hook process timeout);
+`0` disables the wait entirely. A service whose `timeout` exceeds that budget
+cannot be fully guaranteed — raise both values together if you have one.
+Service output is logged to `.toolahead/services/<name>.log`, and
+`toolahead status` shows each service's state.
 
 ## Latency metrics
 
@@ -428,7 +438,12 @@ independently.
   rejected.
 - Every command run ahead uses a fresh disposable copy, never the live
   checkout.
-- The local daemon binds to `127.0.0.1` and adds no remote telemetry.
+- The local daemon binds to `127.0.0.1` and adds no remote telemetry. Requests
+  carry the workspace they came from, so a daemon serving another project
+  refuses them instead of answering for the wrong checkout.
+- What ToolAhead has learned about a project is stored outside it, under
+  `~/.toolahead/`. Nothing a repository ships can steer what gets executed or
+  requested.
 - Declared services never start from an untrusted `toolahead.toml`: approval
   is an explicit `toolahead trust` of the exact file content, stored outside
   the repository and revoked automatically by any change to the file.

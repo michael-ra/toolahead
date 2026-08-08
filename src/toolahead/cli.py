@@ -34,6 +34,9 @@ MCP_TOOL_NAMES = [
     "read_file", "search", "list_files", "edit_file", "write_file", "run",
 ]
 CLAUDE_NATIVE_ANALOGS = ["Read", "Grep", "Glob", "Edit", "Write"]
+# Prozess-Timeout fuer Hooks, die blockierend auf Service-Readiness warten.
+# Muss ueber dem Client-Budget (TOOLAHEAD_ENSURE_WAIT, Default 110s) liegen.
+HOOK_ENSURE_TIMEOUT = 120
 
 
 def _handler(command: str, *, timeout: int = 8) -> dict:
@@ -54,8 +57,12 @@ def _merge_codex_hooks(config: dict, command: str) -> dict:
     wanted = {
         "SessionStart": _group(command),
         "UserPromptSubmit": _group(command),
+        # PreToolUse traegt die blockierende Service-Readiness-Wartezeit. Das
+        # Prozess-Timeout muss deshalb ueber dem Ensure-Budget liegen, sonst
+        # killt Codex den Hook mitten im Warten und der Call laeuft doch zu
+        # frueh — die Garantie waere nur behauptet.
         "PreToolUse": _group(
-            command, matcher="Bash|apply_patch"),
+            command, matcher="Bash|apply_patch", timeout=HOOK_ENSURE_TIMEOUT),
         "PostToolUse": _group(
             command, matcher="Bash|apply_patch", timeout=90),
         "Stop": _group(command),
@@ -133,13 +140,21 @@ def _replay_enabled(args) -> bool:
 
 
 def _remove_managed_toml(existing: str) -> str:
-    if MCP_BEGIN not in existing:
-        return existing
-    start = existing.index(MCP_BEGIN)
-    end = existing.index(MCP_END, start) + len(MCP_END) \
-        if MCP_END in existing[start:] else len(existing)
-    stripped = (existing[:start].rstrip() + "\n" + existing[end:].lstrip())
-    return stripped.strip() + "\n" if stripped.strip() else ""
+    """Entfernt jeden verwalteten Block — und nur den.
+
+    Fehlt die Endmarke, wird NICHT bis zum Dateiende geloescht: dahinter
+    stehen womoeglich eigene Sektionen des Nutzers. Der Aktivierungspfad
+    verweigert denselben Fall bereits; hier gilt dasselbe.
+    """
+    while MCP_BEGIN in existing:
+        start = existing.index(MCP_BEGIN)
+        if MCP_END not in existing[start:]:
+            raise ValueError(
+                "incomplete ToolAhead managed block: end marker missing; "
+                "remove the block by hand to avoid deleting your own config")
+        end = existing.index(MCP_END, start) + len(MCP_END)
+        existing = existing[:start].rstrip() + "\n" + existing[end:].lstrip()
+    return existing.strip() + "\n" if existing.strip() else ""
 
 
 def _merge_claude_hook(config: dict, command: str) -> dict:
@@ -152,7 +167,8 @@ def _merge_claude_hook(config: dict, command: str) -> dict:
     """
     hooks = config.setdefault("hooks", {})
     wanted = {
-        "PreToolUse": _group(command, matcher="Bash", timeout=90),
+        "PreToolUse": _group(command, matcher="Bash",
+                             timeout=HOOK_ENSURE_TIMEOUT),
         "PostToolUse": _group(
             command, matcher="Bash|Edit|Write|MultiEdit|NotebookEdit|"
                              "Read|Grep|Glob", timeout=10),
@@ -172,18 +188,85 @@ def _merge_claude_hook(config: dict, command: str) -> dict:
     return config
 
 
-def _enable_claude_strict_routing(config: dict) -> dict:
-    """Hide native analogs so the model sees one coherent file-tool suite."""
+def _owned_denies_path(project: Path) -> Path:
+    """Wo notiert ist, welche Deny-Eintraege ToolAhead selbst gesetzt hat."""
+    return project / ".toolahead" / "claude-denies.json"
 
+
+def _read_owned_denies(project: Path) -> list[str]:
+    try:
+        value = json.loads(_owned_denies_path(project).read_text(
+            encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [item for item in value if isinstance(item, str)] \
+        if isinstance(value, list) else []
+
+
+def _write_owned_denies(project: Path, names: list[str]) -> None:
+    path = _owned_denies_path(project)
+    if names:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(sorted(names), indent=2) + "\n",
+                        encoding="utf-8")
+    elif path.exists():
+        path.unlink()
+
+
+def _enable_claude_strict_routing(config: dict, project: Path | None = None) -> dict:
+    """Hide native analogs so the model sees one coherent file-tool suite.
+
+    Merkt sich, welche Eintraege ToolAhead wirklich HINZUGEFUEGT hat. Nur die
+    duerfen spaeter wieder verschwinden — eine schon vorher vorhandene
+    Deny-Regel gehoert dem Nutzer.
+    """
     permissions = config.setdefault("permissions", {})
     if not isinstance(permissions, dict):
         raise ValueError("'permissions' must be an object")
     deny = permissions.setdefault("deny", [])
     if not isinstance(deny, list):
         raise ValueError("'permissions.deny' must be an array")
+    added = []
     for name in CLAUDE_NATIVE_ANALOGS:
         if name not in deny:
             deny.append(name)
+            added.append(name)
+    if project is not None:
+        # Frueher Hinzugefuegtes bleibt vermerkt: ein zweiter --strict-Lauf
+        # fuegt nichts mehr hinzu, der Besitz von damals gilt weiter.
+        _write_owned_denies(project,
+                            sorted(set(added) | set(_read_owned_denies(project))))
+    return config
+
+
+def _disable_claude_strict_routing(config: dict, project: Path | None = None) -> dict:
+    """Restore the native file tools when strict routing is not requested.
+
+    Without this, a later non-strict init removes the ToolAhead MCP tools but
+    leaves the denials in place — the agent would then have neither the native
+    nor the replacement file tools.
+
+    Entfernt werden ausschliesslich Eintraege, die ToolAhead nachweislich
+    selbst gesetzt hat. Ein Projekt, das ``Edit``/``Write`` aus eigenen
+    Gruenden sperrt, behaelt seine Regeln — die haben wir nie angefasst.
+    """
+    owned = set(_read_owned_denies(project)) if project is not None else set()
+    if not owned:
+        return config
+    permissions = config.get("permissions")
+    if not isinstance(permissions, dict):
+        _write_owned_denies(project, [])
+        return config
+    deny = permissions.get("deny")
+    if not isinstance(deny, list):
+        _write_owned_denies(project, [])
+        return config
+    permissions["deny"] = [name for name in deny if name not in owned]
+    if not permissions["deny"]:
+        permissions.pop("deny")
+    if not permissions:
+        config.pop("permissions", None)
+    _write_owned_denies(project, [])
     return config
 
 
@@ -199,7 +282,9 @@ def init_codex(args) -> int:
     installed_hook = hook_dir / "codex_hook.py"
     _runtime_dir, installed_mcp = _runtime(project)
     url = getattr(args, "url", DEFAULT_URL)
-    command = shlex.join(["python3", str(installed_hook)])
+    # Die Daemon-Adresse gehoert in den Hook-Command: sonst fragt jedes
+    # Projekt den Default-Port und damit womoeglich einen fremden Daemon.
+    command = shlex.join(["python3", str(installed_hook), "--url", url])
     if path.exists():
         try:
             config = json.loads(path.read_text(encoding="utf-8"))
@@ -232,10 +317,14 @@ def init_codex(args) -> int:
     shutil.copy2(CODEX_HOOK, installed_hook)
     shutil.copy2(REPLAY_HELPER, hook_dir / "prefetch_replay.py")
     _install_mcp_runtime(project)
+    marker = _strict_marker(project)
     if getattr(args, "strict", False):
-        marker = _strict_marker(project)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text("strict MCP routing enabled\n", encoding="utf-8")
+    elif marker.exists():
+        # Ohne --strict darf kein Marker ueberleben: der Hook wuerde sonst
+        # weiter auf MCP-Tools verweisen, die dieser Lauf gerade entfernt.
+        marker.unlink()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(payload, encoding="utf-8")
     if mcp_payload or mcp_config.exists():
@@ -264,7 +353,7 @@ def init_claude(args) -> int:
     runtime, installed_mcp = _runtime(project)
     installed_hook = runtime / "prefetch_hook.py"
     url = getattr(args, "url", DEFAULT_URL)
-    hook_command = shlex.join(["python3", str(installed_hook)])
+    hook_command = shlex.join(["python3", str(installed_hook), "--url", url])
 
     def load_object(path: Path) -> dict:
         if not path.exists():
@@ -277,8 +366,12 @@ def init_claude(args) -> int:
     replay_tools = _replay_enabled(args)
     try:
         settings = _merge_claude_hook(load_object(settings_path), hook_command)
-        if getattr(args, "strict", False):
-            settings = _enable_claude_strict_routing(settings)
+        # Strict-Routing spiegelt IMMER das aktuelle Flag: sonst bleiben nach
+        # einem frueheren --strict die Deny-Eintraege stehen, waehrend dieser
+        # Lauf die MCP-Ersatz-Tools entfernt.
+        settings = _enable_claude_strict_routing(settings, project) \
+            if getattr(args, "strict", False) \
+            else _disable_claude_strict_routing(settings, project)
         mcp = load_object(mcp_path)
     except (OSError, ValueError) as exc:
         print(f"Cannot merge Claude project config: {exc}", file=sys.stderr)
@@ -374,12 +467,18 @@ def init_antigravity(args) -> int:
     hooks_path = project / ".agents" / "hooks.json"
     installed_hook = runtime / "antigravity_hook.py"
 
-    def _hook_group(event: str, matcher: str, timeout: int = 5) -> list:
+    def _hook_handler(event: str, timeout: int = 5) -> dict:
         command = shlex.join(["python3", str(installed_hook), event,
                               "--url", url])
+        return {"type": "command", "command": command, "timeout": timeout}
+
+    def _hook_group(event: str, matcher: str, timeout: int = 5) -> list:
         return [{"matcher": matcher,
-                 "hooks": [{"type": "command", "command": command,
-                            "timeout": timeout}]}]
+                 "hooks": [_hook_handler(event, timeout)]}]
+
+    def _flat_hooks(event: str, timeout: int = 5) -> list:
+        """Stop kennt keine Matcher-Gruppen, sondern eine flache Handler-Liste."""
+        return [_hook_handler(event, timeout)]
 
     try:
         hooks = load_object(hooks_path)
@@ -391,9 +490,9 @@ def init_antigravity(args) -> int:
         # PreToolUse wartet bei deklarierten Kommandos blockierend auf
         # Service-Readiness — deshalb das grosse Timeout.
         "PreToolUse": _hook_group("PreToolUse", ANTIGRAVITY_TOOL_MATCHER,
-                                  timeout=120),
+                                  timeout=HOOK_ENSURE_TIMEOUT),
         "PostToolUse": _hook_group("PostToolUse", ANTIGRAVITY_TOOL_MATCHER),
-        "Stop": _hook_group("Stop", "*"),
+        "Stop": _flat_hooks("Stop"),
     }
     mcp_payload = json.dumps(mcp, indent=2, ensure_ascii=False) + "\n"
     hooks_payload = json.dumps(hooks, indent=2, ensure_ascii=False) + "\n"
@@ -487,6 +586,11 @@ def trust(args) -> int:
         check = spec.ready.kind if spec.ready else "process"
         print(f"  service  {name:20} prewarm={spec.prewarm:8} ready={check}")
         print(f"           $ {spec.command}")
+        if spec.warm_routes:
+            # Warm-Routen sind automatische HTTP-GETs gegen den Service.
+            # Wer freigibt, muss sehen, was spaeter ungefragt abgerufen wird.
+            targets = ", ".join(spec.warm_routes)
+            print(f"           auto-GET {spec.base_url() or '?'} → {targets}")
     for rule in manager.rules:
         print(f"  command  {rule.match!r} requires {list(rule.requires)} "
               "(never replayed/cached)")
@@ -565,9 +669,8 @@ def doctor(args) -> int:
     hooks = project / ".codex" / "hooks.json"
     checks.append(("Codex hooks", hooks.exists(), str(hooks)))
     codex_mcp = project / ".codex" / "config.toml"
-    checks.append(("Codex MCP", codex_mcp.exists() and
-                   "[mcp_servers.toolahead]" in codex_mcp.read_text(
-                       encoding="utf-8", errors="replace"), str(codex_mcp)))
+    codex_mcp_ok = codex_mcp.exists() and "[mcp_servers.toolahead]" in \
+        codex_mcp.read_text(encoding="utf-8", errors="replace")
     claude_mcp = project / ".mcp.json"
     claude_ok = False
     try:
@@ -575,7 +678,18 @@ def doctor(args) -> int:
         claude_ok = isinstance(claude_data.get("mcpServers", {}).get("toolahead"), dict)
     except (OSError, ValueError, AttributeError):
         pass
-    checks.append(("Claude MCP", claude_ok, str(claude_mcp)))
+    # Die MCP-Replay-Tools sind seit 0.6 optional. Sie zu fordern wuerde eine
+    # korrekte Default-Installation als kaputt melden. Geprueft wird deshalb
+    # nur Konsistenz: wer strict eingerichtet hat, braucht sie auch.
+    strict = _strict_marker(project).exists()
+    if strict or codex_mcp_ok or claude_ok:
+        if strict or codex_mcp_ok:
+            checks.append(("Codex MCP", codex_mcp_ok, str(codex_mcp)))
+        if strict or claude_ok:
+            checks.append(("Claude MCP", claude_ok, str(claude_mcp)))
+    else:
+        checks.append(("MCP replay tools", True,
+                       "off (hooks-only; add --replay-tools to enable)"))
     replay = project / ".prefetch-replay.json"
     checks.append(("Replay allowlist", replay.exists(), str(replay)))
     try:

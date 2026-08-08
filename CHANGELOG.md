@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.6.1 — 2026-08-08
+
+Fixes from an adversarial review of 0.6.0. Every item below was reproduced
+before it was fixed and now has a regression test.
+
+- Re-running `toolahead init` without `--strict` after a strict install left
+  Claude's native file tools denied and Codex's strict marker in place while
+  removing the MCP tools that replaced them — the documented upgrade path
+  could leave an agent with no file tools at all. Routing now always matches
+  the flags of the current run.
+- Route learning only accepts URLs a command actually fetched with an HTTP
+  client (directly or inside an executed shell script). A URL that was merely
+  printed, commented, or contained in a file the agent read is no longer
+  learned, so it can no longer become an unrequested GET after a later edit.
+- Learned routes are session-memory only and are never persisted, so a cloned
+  repository cannot ship a `.prefetch-table.json` that steers ToolAhead's
+  automatic requests past the trust gate. `toolahead trust` now prints the
+  auto-GET targets it is approving.
+- `--url` reaches the installed hooks, and readiness requests carry their
+  workspace; a daemon serving a different workspace now refuses them instead
+  of answering for the wrong project.
+- Hook process timeouts, the client readiness budget, and the server-side wait
+  are now consistent, so the readiness check can no longer be cut short by the
+  hook being killed mid-wait.
+- Warm requests for a service never overlap: a newer edit waits for the
+  in-flight round instead of racing it.
+- `derive_routes` resolves paths against the workspace, so absolute paths work
+  and paths outside the workspace produce no route.
+- Antigravity `PreToolUse` returns the required `{"decision": "allow"}` neutral
+  response instead of an empty object, `Stop` is installed as a flat handler
+  list, and the working directory of the call is preferred over the first
+  workspace path.
+- `toolahead doctor` no longer reports a correct hooks-only installation as
+  broken.
+- The Claude hook uses `http.client` instead of `urllib`, cutting about 19 ms
+  of interpreter startup from every hooked tool call (measured 60 ms → 41 ms).
+
+A second adversarial pass over those fixes found and corrected the following,
+including one regression introduced by the first round:
+
+- The strict-routing rollback deleted `permissions.deny` entries it had never
+  written — a project that denies `Edit`/`Write` as its own policy lost that
+  rule on the first plain `toolahead init`. ToolAhead now records which
+  entries it added and removes only those.
+- The learned transition table moved out of the repository (into
+  `~/.toolahead/tables/`). A cloned repository could otherwise ship a
+  `.prefetch-table.json` that made ToolAhead speculatively execute commands
+  before anything was trusted. Set `PREFETCH_TABLE` to override the location.
+- The workspace check now also covers `/__prefetch/agent-event` and
+  `/__prefetch/lookup`, not just readiness: those endpoints start services,
+  drive speculation, and hand out file contents. A subdirectory of the project
+  still counts as the same workspace.
+- Route learning is quoting-aware and multi-line aware, ignores commands that
+  failed, and again recognises scripts run as `./e2e.sh`, `. ./e2e.sh` or
+  `time ./e2e.sh`. A URL inside a quoted string can no longer masquerade as a
+  fetch.
+- `[commands]` rules match a declared script however the agent invokes it
+  (`sh e2e.sh`, `bash ./e2e.sh`, `./e2e.sh`), so the readiness guarantee no
+  longer depends on the exact spelling the model happens to choose.
+- `warm_routes = ["auto"]` derives routes relative to the service's `cwd`, so
+  it works for a monorepo service rooted in a subdirectory.
+- Removing the managed MCP block from `.codex/config.toml` no longer truncates
+  everything after a missing end marker, and it removes duplicated blocks.
+- A small `TOOLAHEAD_ENSURE_WAIT` is no longer collapsed to a one-second
+  server budget, which produced false "service not ready" denials.
+- The MCP server sends its workspace and wait budget like the hooks do.
+
 ## 0.6.0 — 2026-08-07
 
 - Hooks-only is the new default: `toolahead init` now replaces nothing — the

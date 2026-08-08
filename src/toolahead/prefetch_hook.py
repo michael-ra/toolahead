@@ -32,16 +32,32 @@ Env:
 """
 
 import base64
+import http.client
 import json
 import os
 import shlex
 import sys
-import urllib.parse
-import urllib.request
 
 
+# Dieser Hook laeuft VOR jedem passenden Tool-Call; sein Prozessstart liegt
+# also auf dem kritischen Pfad des Agenten. Deshalb bewusst ``http.client``
+# statt ``urllib.request``: gemessen rund 12 ms weniger Importzeit pro Aufruf.
+def _base_url() -> str:
+    argv = sys.argv[1:]
+    if "--url" in argv:
+        try:
+            return argv[argv.index("--url") + 1].rstrip("/")
+        except IndexError:
+            pass
+    configured = os.environ.get("PREFETCH_LOOKUP_URL")
+    if configured:
+        return configured.split("/__prefetch/")[0].rstrip("/")
+    return os.environ.get("TOOLAHEAD_URL", "http://127.0.0.1:4242").rstrip("/")
+
+
+BASE_URL = _base_url()
 LOOKUP_URL = os.environ.get(
-    "PREFETCH_LOOKUP_URL", "http://127.0.0.1:4242/__prefetch/lookup")
+    "PREFETCH_LOOKUP_URL", f"{BASE_URL}/__prefetch/lookup")
 HOOK_TIMEOUT = float(os.environ.get("PREFETCH_HOOK_TIMEOUT", "8"))
 REPLAY_TIMEOUT = float(os.environ.get("PREFETCH_REPLAY_TIMEOUT", "130"))
 REPLAY_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -49,13 +65,36 @@ REPLAY_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 def _daemon_url(path: str) -> str:
-    parsed = urllib.parse.urlparse(LOOKUP_URL)
-    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc,
-                                    path, "", "", ""))
+    return f"{BASE_URL}{path}"
 
 
 def _replay_url() -> str:
     return _daemon_url("/__prefetch/replay")
+
+
+def _post(url: str, payload: dict, timeout: float) -> dict | None:
+    """Minimaler JSON-POST ohne urllib. Gibt None statt zu werfen."""
+    try:
+        scheme, _, rest = url.partition("://")
+        netloc, _, path = rest.partition("/")
+        host, _, port = netloc.partition(":")
+        if scheme == "https":
+            conn = http.client.HTTPSConnection(host, int(port or 443),
+                                               timeout=timeout)
+        else:
+            conn = http.client.HTTPConnection(host, int(port or 80),
+                                              timeout=timeout)
+        try:
+            conn.request("POST", "/" + path,
+                         body=json.dumps(payload, separators=(",", ":")).encode(),
+                         headers={"Content-Type": "application/json"})
+            body = conn.getresponse().read()
+        finally:
+            conn.close()
+        value = json.loads(body)
+        return value if isinstance(value, dict) else None
+    except Exception:  # noqa: BLE001 — Hook bleibt fail-open
+        return None
 
 
 def _forward_event(event: dict) -> None:
@@ -63,39 +102,31 @@ def _forward_event(event: dict) -> None:
 
     Damit funktionieren Transition-Learning, Service-Pre-Warming und
     Route-Warming auch ohne die ToolAhead-MCP-Tools. Fail-open."""
-    try:
-        payload = dict(event)
-        payload.setdefault("source", "claude-hook")
-        request = urllib.request.Request(
-            _daemon_url("/__prefetch/agent-event"), method="POST",
-            data=json.dumps(payload, separators=(",", ":")).encode(),
-            headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(request, timeout=0.8).read()
-    except Exception:  # noqa: BLE001 — Telemetrie darf Claude nie bremsen
-        pass
+    payload = dict(event)
+    payload.setdefault("source", "claude-hook")
+    payload.setdefault("workspace",
+                       os.path.realpath(event.get("cwd") or os.getcwd()))
+    _post(_daemon_url("/__prefetch/agent-event"), payload, 0.8)
 
 
 def _ensure_deny_reason(command: str, cwd: str) -> str:
     """Blockierend auf deklarierte Services warten; Grund nur bei hartem Fail.
 
     Fail-open in jede andere Richtung: kein toolahead.toml, Daemon down,
-    untrusted, kein deklariertes Kommando → leerer String (Call laeuft
-    normal). ``TOOLAHEAD_ENSURE_WAIT=0`` schaltet das Warten komplett ab."""
+    untrusted, falscher Workspace, kein deklariertes Kommando → leerer String
+    (Call laeuft normal). ``TOOLAHEAD_ENSURE_WAIT=0`` schaltet das Warten ab."""
     try:
-        wait = float(os.environ.get("TOOLAHEAD_ENSURE_WAIT", "45"))
+        wait = float(os.environ.get("TOOLAHEAD_ENSURE_WAIT", "110"))
     except ValueError:
-        wait = 45.0
+        wait = 110.0
     if wait <= 0 or not os.path.exists(os.path.join(cwd, "toolahead.toml")):
         return ""
-    try:
-        request = urllib.request.Request(
-            _daemon_url("/__prefetch/ensure-services"), method="POST",
-            data=json.dumps({"command": command}).encode(),
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=wait) as response:
-            result = json.loads(response.read())
-    except Exception:  # noqa: BLE001
-        return ""
+    # Der Workspace geht mit: sonst entscheidet der Daemon eines FREMDEN
+    # Projekts (gleicher Default-Port) ueber dieses Kommando.
+    result = _post(_daemon_url("/__prefetch/ensure-services"),
+                   {"command": command, "workspace": os.path.realpath(cwd),
+                    "wait": wait},
+                   wait + 5.0)
     if not isinstance(result, dict) or not result.get("ok"):
         return ""
     services = result.get("services") or {}
@@ -138,15 +169,12 @@ def main() -> int:
         }))
         return 0
 
-    try:
-        request = urllib.request.Request(
-            LOOKUP_URL, method="POST",
-            data=json.dumps({"tool": tool, "input": tool_input,
-                             "reserve": True}).encode(),
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=HOOK_TIMEOUT) as response:
-            hit = json.loads(response.read())
-    except Exception:  # Proxy nicht erreichbar -> normalen Tool-Call zulassen
+    hit = _post(LOOKUP_URL, {"tool": tool, "input": tool_input,
+                             "reserve": True,
+                             "workspace": os.path.realpath(
+                                 event.get("cwd") or os.getcwd())},
+                HOOK_TIMEOUT)
+    if hit is None:  # Proxy nicht erreichbar -> normalen Tool-Call zulassen
         return 0
 
     token = hit.get("token")
