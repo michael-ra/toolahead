@@ -706,7 +706,10 @@ def doctor(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="toolahead")
-    sub = parser.add_subparsers(dest="subcommand", required=True)
+    # Bewusst nicht required: `toolahead` ohne Argumente ist das Erste, was
+    # jemand tippt. Eine Fehlermeldung als Begruessung waere die schlechteste
+    # denkbare erste Sekunde mit dem Werkzeug.
+    sub = parser.add_subparsers(dest="subcommand")
 
     serve_cmd = sub.add_parser("serve", help="start the local daemon/proxy")
     serve_cmd.add_argument("--workspace", default=os.getcwd())
@@ -807,8 +810,31 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+GETTING_STARTED = """ToolAhead — your agent's next tool call, already done.
+
+Get started in the project you want to accelerate:
+
+  toolahead init            connect Claude Code and Codex (hooks only,
+                            replaces none of their tools)
+  toolahead allow "CMD"     let one exact test/lint command be reused
+  toolahead serve           run the local daemon for this workspace
+
+Then use your agent as usual. `toolahead status` shows what was saved.
+
+Optional: declare dev servers in toolahead.toml and approve them once with
+`toolahead trust` to have them pre-warmed while the model reasons.
+
+Full list of commands: toolahead --help
+Docs: https://github.com/michael-ra/toolahead
+"""
+
+
 def main() -> int:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    if getattr(args, "func", None) is None:
+        print(GETTING_STARTED, end="")
+        return 0
     return int(args.func(args))
 
 

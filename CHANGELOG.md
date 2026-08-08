@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.4 — 2026-08-08
+
+- `toolahead` with no arguments now prints a short getting-started summary and
+  exits 0. It used to answer the very first command anyone types — `uvx
+  toolahead` — with an argparse error.
+
 ## 0.6.3 — 2026-08-08
 
 - An explicit `--url` in the installed hook command now wins over

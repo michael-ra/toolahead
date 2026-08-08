@@ -344,6 +344,22 @@ class CommandRuleMatchTest(unittest.TestCase):
                 self.assertFalse(self.rule.matches(command))
 
 
+class BareInvocationTest(unittest.TestCase):
+    """`uvx toolahead` ist der erste Befehl, den jemand tippt — er darf nicht
+    mit einer argparse-Fehlermeldung antworten."""
+
+    def test_no_subcommand_prints_guidance_and_succeeds(self):
+        result = _cli()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("error:", result.stderr)
+        self.assertIn("toolahead init", result.stdout)
+        self.assertIn("github.com/michael-ra/toolahead", result.stdout)
+
+    def test_unknown_subcommand_still_fails(self):
+        result = _cli("definitely-not-a-command")
+        self.assertNotEqual(result.returncode, 0)
+
+
 class HookUrlPrecedenceTest(unittest.TestCase):
     """Ein explizites --url muss die Umgebung schlagen: sonst reserviert der
     Hook beim einen Daemon und der umgeschriebene Befehl holt das Ergebnis
