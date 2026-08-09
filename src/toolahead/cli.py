@@ -274,6 +274,63 @@ def _strict_marker(project: Path) -> Path:
     return project / ".toolahead" / "strict-mcp"
 
 
+def _agy_plugin_dir() -> Path:
+    return Path.home() / ".toolahead" / "agy-plugin"
+
+
+def _install_agy_plugin() -> tuple[Path, bool]:
+    """Installiert die Antigravity-Hooks als agy-Plugin.
+
+    Die Antigravity-CLI liest Lifecycle-Hooks ausschliesslich aus Plugins
+    (``plugin.json`` + ``hooks.json`` im Wurzelverzeichnis), nicht aus
+    ``.agents/hooks.json`` — das gilt nur fuer die IDE. Ohne Plugin sieht die
+    CLI ueberhaupt keine Hooks.
+
+    Plugins sind bei agy global, ToolAhead ist projektbezogen. Deshalb traegt
+    das Plugin bewusst KEINE Projekt-URL: der Hook meldet den Workspace des
+    Aufrufs mit, und ein Daemon fuer ein anderes Projekt weist ihn ab. So
+    genuegt eine Installation fuer alle Projekte.
+    """
+    plugin = _agy_plugin_dir()
+    plugin.mkdir(parents=True, exist_ok=True)
+    # Eigene Kopie des Hooks: unter uvx ist der Paketpfad fluechtig.
+    installed_hook = plugin / "antigravity_hook.py"
+    shutil.copy2(ANTIGRAVITY_HOOK, installed_hook)
+    (plugin / "plugin.json").write_text(json.dumps({
+        "name": "toolahead",
+        "description": "ToolAhead — speculative tool execution and service "
+                       "pre-warming for coding agents",
+        "version": _package_version(),
+    }, indent=2) + "\n", encoding="utf-8")
+
+    def group(event: str, timeout: int) -> list:
+        command = shlex.join(["python3", str(installed_hook), event])
+        return [{"matcher": ANTIGRAVITY_TOOL_MATCHER,
+                 "hooks": [{"type": "command", "command": command,
+                            "timeout": timeout}]}]
+
+    (plugin / "hooks.json").write_text(json.dumps({
+        "hooks": {
+            "PreToolUse": group("PreToolUse", HOOK_ENSURE_TIMEOUT),
+            "PostToolUse": group("PostToolUse", 10),
+        }
+    }, indent=2) + "\n", encoding="utf-8")
+
+    if shutil.which("agy") is None:
+        return plugin, False
+    result = subprocess.run(["agy", "plugin", "install", str(plugin)],
+                            capture_output=True, text=True)
+    return plugin, result.returncode == 0
+
+
+def _package_version() -> str:
+    try:
+        from . import __version__
+        return __version__
+    except ImportError:  # pragma: no cover - project-local runtime copy
+        return "0"
+
+
 def init_codex(args) -> int:
     project = Path(args.project).resolve()
     path = project / ".codex" / "hooks.json"
@@ -509,7 +566,13 @@ def init_antigravity(args) -> int:
     replay = project / ".prefetch-replay.json"
     if not replay.exists():
         replay.write_text('{\n  "commands": []\n}\n', encoding="utf-8")
-    print(f"Installed Antigravity hooks: {hooks_path}")
+    plugin_dir, plugin_installed = _install_agy_plugin()
+    print(f"Installed Antigravity hooks: {hooks_path} (IDE)")
+    if plugin_installed:
+        print(f"Installed agy CLI plugin:    {plugin_dir}")
+    else:
+        print(f"Prepared agy CLI plugin:     {plugin_dir}")
+        print(f"  Enable it with:            agy plugin install {plugin_dir}")
     if replay_tools:
         print(f"Installed Antigravity MCP:   {mcp_path}")
         print("Run /mcp once in the prompt panel to confirm toolahead is "

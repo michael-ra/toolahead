@@ -149,17 +149,48 @@ Claude Code:
 ANTHROPIC_BASE_URL=http://127.0.0.1:4242 claude
 ```
 
-Google Antigravity: open the project as usual — `init-antigravity` installs
-both the workspace MCP server (`.agents/mcp_config.json`) and lifecycle hooks
-(`.agents/hooks.json`). The hooks observe Antigravity's *native* tools
-(`run_command`, `view_file`, `replace_file_content`, …), so learning, service
-pre-warming, and route warming work even when the agent never touches the
-ToolAhead MCP tools. Run `/mcp` in the prompt panel once to confirm the
-`toolahead` server is enabled. Antigravity support is still **experimental**:
-the CLI registers workspace MCP tools lazily and its agents cannot always
-invoke them (observed on CLI 1.1.11) — which limits replay hits, not
-pre-warming — and print mode loads neither MCP servers nor project context.
-Measured speedups so far are from Claude Code and Codex sessions.
+Google Antigravity: `init-antigravity` covers both surfaces, because they
+discover hooks differently.
+
+- **The `agy` CLI reads lifecycle hooks only from plugins.** ToolAhead writes
+  one to `~/.toolahead/agy-plugin/` and installs it automatically when `agy`
+  is on your PATH (otherwise it prints the `agy plugin install` command).
+  Verified against CLI 1.1.11: the daemon receives Antigravity's native tool
+  events with `source: antigravity-hook`. The plugin is global on purpose and
+  carries no project URL — each hook reports the workspace it ran in, and a
+  daemon serving a different project refuses it, so one install covers every
+  project.
+- **The IDE** additionally uses the workspace files `.agents/hooks.json` and
+  `.agents/mcp_config.json`, which `init-antigravity` also writes. Run `/mcp`
+  in the prompt panel once to confirm the `toolahead` server is enabled.
+
+How much each agent reports natively differs, and it decides what ToolAhead can
+learn without the MCP tools:
+
+| Agent | Native tool events ToolAhead receives |
+| --- | --- |
+| Claude Code | `Bash`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `Read`, `Grep`, `Glob` |
+| Antigravity | `run_command`, `view_file`, `write_to_file`, `replace_file_content`, `multi_replace_file_content`, `grep_search`, `find_by_name` |
+| Codex CLI | `Bash` and `apply_patch` only |
+
+So on Claude Code and Antigravity, learning, service pre-warming, and route
+warming all work without the ToolAhead MCP tools. On Codex, mutation-triggered
+pre-warming and command replay work the same way, but read and search
+sequences are invisible to the hooks — learning those needs `--replay-tools`.
+
+Antigravity support remains **experimental**, and one limitation is worth
+knowing before you try it. On CLI 1.1.11, `agy --print` reports
+`workspacePaths: []` and runs commands in its own scratch directory
+(`~/.gemini/antigravity-cli/scratch`) rather than in your project. ToolAhead
+therefore correctly does nothing there — there is no project state to
+accelerate. The hook path itself is verified: the daemon receives Antigravity's
+native tool events with the right tool mapping and model. What is **not**
+verified is an end-to-end speedup on Antigravity, because the CLI's print mode
+never puts the agent in the project. The IDE is expected to behave differently;
+if you use it, feedback on whether pre-warming engages is very welcome.
+
+The measured speedups quoted in this README come from Claude Code and Codex
+sessions.
 
 See live timing and cache statistics at any time:
 

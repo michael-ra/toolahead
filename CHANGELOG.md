@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.0 — 2026-08-09
+
+- **The Antigravity CLI never saw ToolAhead's hooks.** `agy` reads lifecycle
+  hooks only from installed plugins, not from `.agents/hooks.json` — its log
+  said `loaded 0 named hooks from 0 hooks.json file(s)` and no event ever
+  reached the daemon. `init-antigravity` now also writes a plugin to
+  `~/.toolahead/agy-plugin/` and installs it when `agy` is on your PATH
+  (otherwise it prints the command). Verified on CLI 1.1.11: the daemon
+  receives Antigravity's native tool events with the correct mapping.
+  The plugin deliberately carries no project URL — agy plugins are global,
+  and the daemon's workspace check keeps projects apart, so one install
+  covers all of them.
+- Documented what each agent reports natively. Claude Code and Antigravity
+  expose their full file/search/command surface to the hooks; Codex reports
+  only `Bash` and `apply_patch`, so read/search learning there needs
+  `--replay-tools`.
+- Documented an Antigravity CLI limitation found while testing: `agy --print`
+  reports no workspace and runs commands in its own scratch directory, so
+  there is no project state to accelerate in print mode. End-to-end speedups
+  on Antigravity remain unverified.
+
 ## 0.6.4 — 2026-08-08
 
 - `toolahead` with no arguments now prints a short getting-started summary and
