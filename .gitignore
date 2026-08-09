@@ -19,6 +19,19 @@ coverage.xml
 /prefetch-table.json
 .prefetch-telemetry*.json
 .toolahead/
+
+# Everything `toolahead init` generates when dogfooding ToolAhead inside its
+# own checkout. These files embed absolute paths to the developer's home
+# directory, so committing them would publish it.
+/.claude/
+/.codex/
+/.agents/
+/.mcp.json
+/.prefetch-replay.json
+/toolahead.toml
+.trust-store.json
+.env
+.env.*
 .tickets/
 build/
 dist/
