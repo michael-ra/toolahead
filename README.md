@@ -164,19 +164,8 @@ discover hooks differently.
   `.agents/mcp_config.json`, which `init-antigravity` also writes. Run `/mcp`
   in the prompt panel once to confirm the `toolahead` server is enabled.
 
-How much each agent reports natively differs, and it decides what ToolAhead can
-learn without the MCP tools:
-
-| Agent | Native tool events ToolAhead receives |
-| --- | --- |
-| Claude Code | `Bash`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `Read`, `Grep`, `Glob` |
-| Antigravity | `run_command`, `view_file`, `write_to_file`, `replace_file_content`, `multi_replace_file_content`, `grep_search`, `find_by_name` |
-| Codex CLI | `Bash` and `apply_patch` only |
-
-So on Claude Code and Antigravity, learning, service pre-warming, and route
-warming all work without the ToolAhead MCP tools. On Codex, mutation-triggered
-pre-warming and command replay work the same way, but read and search
-sequences are invisible to the hooks — learning those needs `--replay-tools`.
+The hooks observe Antigravity's *native* tools, so learning, service
+pre-warming, and route warming work without the ToolAhead MCP tools.
 
 Antigravity support remains **experimental**, and one limitation is worth
 knowing before you try it. On CLI 1.1.11, `agy --print` reports
@@ -209,6 +198,19 @@ learning and pre-warming, and (on Claude Code and Codex) replay allowlisted
 Bash commands transparently. Registering the ToolAhead tools adds the one
 thing hooks cannot do — serving prepared file-read and search results — because
 only the tool that owns a call can answer it from memory.
+
+How much each agent reports natively differs, and that decides what can be
+learned without the MCP tools:
+
+| Agent | Native tool events the hooks receive |
+| --- | --- |
+| Claude Code | `Bash`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `Read`, `Grep`, `Glob` |
+| Antigravity | `run_command`, `view_file`, `write_to_file`, `replace_file_content`, `multi_replace_file_content`, `grep_search`, `find_by_name` |
+| Codex CLI | `Bash` and `apply_patch` only |
+
+Codex is the exception worth planning around: mutation-triggered pre-warming
+and command replay work there exactly as elsewhere, but read and search
+sequences never reach the hooks, so learning those needs `--replay-tools`.
 
 | MCP tool | Familiar input | Can run ahead | Behavior |
 | --- | --- | :---: | --- |
