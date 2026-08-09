@@ -39,9 +39,18 @@ FORBIDDEN_SUFFIXES = (
 PRIVATE_PATTERNS = {
     "macOS home path": re.compile(rb"/Users/[^/\s]+/"),
     "macOS temporary path": re.compile(rb"/private/var/folders/"),
-    "Windows home path": re.compile(rb"[A-Za-z]:\\\\Users\\\\[^\\\s]+\\\\"),
+    # Release archives are built on ubuntu-latest, so a leaked build path is
+    # far more likely to be a Linux home than a macOS one.
+    "Linux home path": re.compile(rb"/home/[^/\s]+/"),
+    # Both spellings: a raw path in text, and the escaped form in JSON/source.
+    "Windows home path": re.compile(rb"[A-Za-z]:\\{1,2}Users\\{1,2}[^\\\s]+"),
+    "email address": re.compile(
+        rb"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z]{2,}"),
     "Anthropic API key": re.compile(rb"sk-ant-[A-Za-z0-9_-]{12,}"),
     "OpenAI API key": re.compile(rb"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
+    "GitHub token": re.compile(rb"gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}"),
+    "AWS access key": re.compile(rb"AKIA[0-9A-Z]{16}"),
+    "private key block": re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
 }
 
 
